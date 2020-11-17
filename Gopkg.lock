@@ -372,12 +372,12 @@
   version = "v0.3.0"
 
 [[projects]]
-  branch = "PMM-6826-disk_size"
-  digest = "1:3cd1e13ac41af7afe07db51bb94a1b97e0ac9f68b535d54627600d9089b36385"
+  branch = "demo-dbaas-alpha2"
+  digest = "1:82b51a2316a7be9823a4c61f54afaec0cc0b8b658ed6fd9b7f9798bc8d17cacd"
   name = "github.com/percona-platform/dbaas-api"
   packages = ["gen/controller"]
   pruneopts = "NUT"
-  revision = "8391d1cfed0583f9b2d3e7cdcfc7f40cedd40648"
+  revision = "0cb4a17a79935900e329c0fb632d910e5c8e1652"
 
 [[projects]]
   branch = "main"
@@ -403,8 +403,8 @@
   version = "v0.7.2"
 
 [[projects]]
-  branch = "PMM-6826-disk_size"
-  digest = "1:881eca462f355eb8c4fee39b41f9e5be41f04b681ccddf90a8b843ebf465bb4c"
+  branch = "demo-dbaas-alpha2"
+  digest = "1:df41770890703b77f4de63d8ef9f5567b3b16323497e4451ff6f053bf0635fda"
   name = "github.com/percona/pmm"
   packages = [
     "api/agentpb",
@@ -426,7 +426,7 @@
     "version",
   ]
   pruneopts = "NUT"
-  revision = "d7f114a299a5309b8d77672db86da901eb75bb3f"
+  revision = "c18e2737980faf2a21f9189f605a3ca20e0f29c5"
 
 [[projects]]
   digest = "1:dbee7dc52291bb149388085eeb20561d4cb3c2044e0fa6ffa8d342c6b305f4bf"
