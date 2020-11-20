@@ -71,6 +71,9 @@ func (this *CreatePSMDBClusterRequest) Validate() error {
 			return github_com_mwitkow_go_proto_validators.FieldError("Params", err)
 		}
 	}
+	if this.PmmPublicAddressUrl == "" {
+		return github_com_mwitkow_go_proto_validators.FieldError("PmmPublicAddressUrl", fmt.Errorf(`value '%v' must not be an empty string`, this.PmmPublicAddressUrl))
+	}
 	return nil
 }
 func (this *CreatePSMDBClusterResponse) Validate() error {
