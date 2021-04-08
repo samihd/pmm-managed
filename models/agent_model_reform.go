@@ -47,6 +47,7 @@ func (v *agentTableType) Columns() []string {
 		"tls_skip_verify",
 		"aws_access_key",
 		"aws_secret_key",
+		"azure_options",
 		"table_count",
 		"table_count_tablestats_group_limit",
 		"query_examples_disabled",
@@ -56,6 +57,7 @@ func (v *agentTableType) Columns() []string {
 		"rds_basic_metrics_disabled",
 		"rds_enhanced_metrics_disabled",
 		"push_metrics",
+		"disabled_collectors",
 		"mongo_db_tls_options",
 	}
 }
@@ -100,6 +102,7 @@ var AgentTable = &agentTableType{
 			{Name: "TLSSkipVerify", Type: "bool", Column: "tls_skip_verify"},
 			{Name: "AWSAccessKey", Type: "*string", Column: "aws_access_key"},
 			{Name: "AWSSecretKey", Type: "*string", Column: "aws_secret_key"},
+			{Name: "AzureOptions", Type: "*AzureOptions", Column: "azure_options"},
 			{Name: "TableCount", Type: "*int32", Column: "table_count"},
 			{Name: "TableCountTablestatsGroupLimit", Type: "int32", Column: "table_count_tablestats_group_limit"},
 			{Name: "QueryExamplesDisabled", Type: "bool", Column: "query_examples_disabled"},
@@ -109,6 +112,7 @@ var AgentTable = &agentTableType{
 			{Name: "RDSBasicMetricsDisabled", Type: "bool", Column: "rds_basic_metrics_disabled"},
 			{Name: "RDSEnhancedMetricsDisabled", Type: "bool", Column: "rds_enhanced_metrics_disabled"},
 			{Name: "PushMetrics", Type: "bool", Column: "push_metrics"},
+			{Name: "DisabledCollectors", Type: "pq.StringArray", Column: "disabled_collectors"},
 			{Name: "MongoDBOptions", Type: "*MongoDBOptions", Column: "mongo_db_tls_options"},
 		},
 		PKFieldIndex: 0,
@@ -118,7 +122,7 @@ var AgentTable = &agentTableType{
 
 // String returns a string representation of this struct or record.
 func (s Agent) String() string {
-	res := make([]string, 29)
+	res := make([]string, 31)
 	res[0] = "AgentID: " + reform.Inspect(s.AgentID, true)
 	res[1] = "AgentType: " + reform.Inspect(s.AgentType, true)
 	res[2] = "RunsOnNodeID: " + reform.Inspect(s.RunsOnNodeID, true)
@@ -138,16 +142,18 @@ func (s Agent) String() string {
 	res[16] = "TLSSkipVerify: " + reform.Inspect(s.TLSSkipVerify, true)
 	res[17] = "AWSAccessKey: " + reform.Inspect(s.AWSAccessKey, true)
 	res[18] = "AWSSecretKey: " + reform.Inspect(s.AWSSecretKey, true)
-	res[19] = "TableCount: " + reform.Inspect(s.TableCount, true)
-	res[20] = "TableCountTablestatsGroupLimit: " + reform.Inspect(s.TableCountTablestatsGroupLimit, true)
-	res[21] = "QueryExamplesDisabled: " + reform.Inspect(s.QueryExamplesDisabled, true)
-	res[22] = "MaxQueryLogSize: " + reform.Inspect(s.MaxQueryLogSize, true)
-	res[23] = "MetricsPath: " + reform.Inspect(s.MetricsPath, true)
-	res[24] = "MetricsScheme: " + reform.Inspect(s.MetricsScheme, true)
-	res[25] = "RDSBasicMetricsDisabled: " + reform.Inspect(s.RDSBasicMetricsDisabled, true)
-	res[26] = "RDSEnhancedMetricsDisabled: " + reform.Inspect(s.RDSEnhancedMetricsDisabled, true)
-	res[27] = "PushMetrics: " + reform.Inspect(s.PushMetrics, true)
-	res[28] = "MongoDBOptions: " + reform.Inspect(s.MongoDBOptions, true)
+	res[19] = "AzureOptions: " + reform.Inspect(s.AzureOptions, true)
+	res[20] = "TableCount: " + reform.Inspect(s.TableCount, true)
+	res[21] = "TableCountTablestatsGroupLimit: " + reform.Inspect(s.TableCountTablestatsGroupLimit, true)
+	res[22] = "QueryExamplesDisabled: " + reform.Inspect(s.QueryExamplesDisabled, true)
+	res[23] = "MaxQueryLogSize: " + reform.Inspect(s.MaxQueryLogSize, true)
+	res[24] = "MetricsPath: " + reform.Inspect(s.MetricsPath, true)
+	res[25] = "MetricsScheme: " + reform.Inspect(s.MetricsScheme, true)
+	res[26] = "RDSBasicMetricsDisabled: " + reform.Inspect(s.RDSBasicMetricsDisabled, true)
+	res[27] = "RDSEnhancedMetricsDisabled: " + reform.Inspect(s.RDSEnhancedMetricsDisabled, true)
+	res[28] = "PushMetrics: " + reform.Inspect(s.PushMetrics, true)
+	res[29] = "DisabledCollectors: " + reform.Inspect(s.DisabledCollectors, true)
+	res[30] = "MongoDBOptions: " + reform.Inspect(s.MongoDBOptions, true)
 	return strings.Join(res, ", ")
 }
 
@@ -174,6 +180,7 @@ func (s *Agent) Values() []interface{} {
 		s.TLSSkipVerify,
 		s.AWSAccessKey,
 		s.AWSSecretKey,
+		s.AzureOptions,
 		s.TableCount,
 		s.TableCountTablestatsGroupLimit,
 		s.QueryExamplesDisabled,
@@ -183,6 +190,7 @@ func (s *Agent) Values() []interface{} {
 		s.RDSBasicMetricsDisabled,
 		s.RDSEnhancedMetricsDisabled,
 		s.PushMetrics,
+		s.DisabledCollectors,
 		s.MongoDBOptions,
 	}
 }
@@ -210,6 +218,7 @@ func (s *Agent) Pointers() []interface{} {
 		&s.TLSSkipVerify,
 		&s.AWSAccessKey,
 		&s.AWSSecretKey,
+		&s.AzureOptions,
 		&s.TableCount,
 		&s.TableCountTablestatsGroupLimit,
 		&s.QueryExamplesDisabled,
@@ -219,6 +228,7 @@ func (s *Agent) Pointers() []interface{} {
 		&s.RDSBasicMetricsDisabled,
 		&s.RDSEnhancedMetricsDisabled,
 		&s.PushMetrics,
+		&s.DisabledCollectors,
 		&s.MongoDBOptions,
 	}
 }

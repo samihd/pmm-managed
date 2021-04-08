@@ -419,6 +419,59 @@ var databaseSchema = [][]string{
 	26: {
 		`ALTER TABLE ia_rules ALTER COLUMN channel_ids DROP NOT NULL`,
 	},
+	27: {
+		`CREATE TABLE backup_locations (
+			id VARCHAR NOT NULL,
+			name VARCHAR NOT NULL CHECK (name <> ''),
+			description VARCHAR NOT NULL,
+			type VARCHAR NOT NULL CHECK (type <> ''),
+			s3_config JSONB,
+			pmm_server_config JSONB,
+			pmm_client_config JSONB,
+
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+
+			PRIMARY KEY (id),
+			UNIQUE (name)
+		)`,
+	},
+	28: {
+		`ALTER TABLE agents ADD COLUMN disabled_collectors VARCHAR[]`,
+	},
+	29: {
+		`CREATE TABLE artifacts (
+			id VARCHAR NOT NULL,
+			name VARCHAR NOT NULL CHECK (name <> ''),
+			vendor VARCHAR NOT NULL CHECK (vendor <> ''),
+			location_id VARCHAR NOT NULL CHECK (location_id <> ''),
+			service_id VARCHAR NOT NULL CHECK (service_id <> ''),
+			data_model VARCHAR NOT NULL CHECK (data_model <> ''),
+			status VARCHAR NOT NULL CHECK (status <> ''),
+			created_at TIMESTAMP NOT NULL,
+
+			PRIMARY KEY (id)
+		)`,
+	},
+	30: {
+		`CREATE TABLE job_results (
+			id VARCHAR NOT NULL,
+			pmm_agent_id VARCHAR CHECK (pmm_agent_id <> ''),
+			type VARCHAR NOT NULL,
+			done BOOLEAN NOT NULL,
+			error VARCHAR NOT NULL,
+			result JSONB,
+
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+
+			PRIMARY KEY (id)
+		)`,
+	},
+	31: {
+		`ALTER TABLE agents
+			ADD COLUMN azure_options VARCHAR`,
+	},
 }
 
 // ^^^ Avoid default values in schema definition. ^^^
@@ -556,7 +609,7 @@ func setupFixture1(q *reform.Querier, username, password string) error {
 	if _, err = createPMMAgentWithID(q, PMMServerAgentID, node.NodeID, nil); err != nil {
 		return err
 	}
-	if _, err = CreateNodeExporter(q, PMMServerAgentID, nil, false); err != nil {
+	if _, err = CreateNodeExporter(q, PMMServerAgentID, nil, false, []string{}); err != nil {
 		return err
 	}
 

@@ -27,6 +27,7 @@ import (
 
 	"github.com/AlekSi/pointer"
 	"github.com/go-sql-driver/mysql"
+	"github.com/lib/pq"
 	"github.com/percona/pmm/version"
 	"gopkg.in/reform.v1"
 )
@@ -37,8 +38,10 @@ import (
 // pmm-managed's PostgreSQL, qan-api's ClickHouse, and VictoriaMetrics.
 type AgentType string
 
-const certificateKeyFilePlaceholder = "certificateKeyFilePlaceholder"
-const caFilePlaceholder = "caFilePlaceholder"
+const (
+	certificateKeyFilePlaceholder = "certificateKeyFilePlaceholder"
+	caFilePlaceholder             = "caFilePlaceholder"
+)
 
 // Agent types (in the same order as in agents.proto).
 const (
@@ -49,6 +52,7 @@ const (
 	PostgresExporterType                AgentType = "postgres_exporter"
 	ProxySQLExporterType                AgentType = "proxysql_exporter"
 	RDSExporterType                     AgentType = "rds_exporter"
+	AzureDatabaseExporterType           AgentType = "azure_database_exporter"
 	QANMySQLPerfSchemaAgentType         AgentType = "qan-mysql-perfschema-agent"
 	QANMySQLSlowlogAgentType            AgentType = "qan-mysql-slowlog-agent"
 	QANMongoDBProfilerAgentType         AgentType = "qan-mongodb-profiler-agent"
@@ -73,6 +77,21 @@ func (c MongoDBOptions) Value() (driver.Value, error) { return jsonValue(c) }
 
 // Scan implements database/sql.Scanner interface. Should be defined on the pointer.
 func (c *MongoDBOptions) Scan(src interface{}) error { return jsonScan(c, src) }
+
+// AzureOptions represents structure for special Azure options.
+type AzureOptions struct {
+	SubscriptionID string `json:"subscription_id"`
+	ClientID       string `json:"client_id"`
+	ClientSecret   string `json:"client_secret"`
+	TenantID       string `json:"tenant_id"`
+	ResourceGroup  string `json:"resource_group"`
+}
+
+// Value implements database/sql/driver.Valuer interface. Should be defined on the value.
+func (c AzureOptions) Value() (driver.Value, error) { return jsonValue(c) }
+
+// Scan implements database/sql.Scanner interface. Should be defined on the pointer.
+func (c *AzureOptions) Scan(src interface{}) error { return jsonScan(c, src) }
 
 // PMMAgentWithPushMetricsSupport - version of pmmAgent,
 // that support vmagent and push metrics mode
@@ -105,6 +124,8 @@ type Agent struct {
 	AWSAccessKey *string `reform:"aws_access_key"`
 	AWSSecretKey *string `reform:"aws_secret_key"`
 
+	AzureOptions *AzureOptions `reform:"azure_options"`
+
 	// TableCount stores last known table count. NULL if unknown.
 	TableCount *int32 `reform:"table_count"`
 
@@ -119,9 +140,10 @@ type Agent struct {
 	MetricsPath           *string `reform:"metrics_path"`
 	MetricsScheme         *string `reform:"metrics_scheme"`
 
-	RDSBasicMetricsDisabled    bool `reform:"rds_basic_metrics_disabled"`
-	RDSEnhancedMetricsDisabled bool `reform:"rds_enhanced_metrics_disabled"`
-	PushMetrics                bool `reform:"push_metrics"`
+	RDSBasicMetricsDisabled    bool           `reform:"rds_basic_metrics_disabled"`
+	RDSEnhancedMetricsDisabled bool           `reform:"rds_enhanced_metrics_disabled"`
+	PushMetrics                bool           `reform:"push_metrics"`
+	DisabledCollectors         pq.StringArray `reform:"disabled_collectors"`
 
 	MongoDBOptions *MongoDBOptions `reform:"mongo_db_tls_options"`
 }
@@ -355,10 +377,41 @@ func (s *Agent) DSN(service *Service, dialTimeout time.Duration, database string
 			u.User = url.User(username)
 		}
 		return u.String()
-
 	default:
 		panic(fmt.Errorf("unhandled AgentType %q", s.AgentType))
 	}
+}
+
+// ExporterURL composes URL to an external exporter.
+func (s *Agent) ExporterURL(q *reform.Querier) (string, error) {
+	scheme := pointer.GetString(s.MetricsScheme)
+	path := pointer.GetString(s.MetricsPath)
+	listenPort := int(pointer.GetUint16(s.ListenPort))
+	username := pointer.GetString(s.Username)
+	password := pointer.GetString(s.Password)
+
+	host := "127.0.0.1"
+	if !s.PushMetrics {
+		node, err := FindNodeByID(q, *s.RunsOnNodeID)
+		if err != nil {
+			return "", err
+		}
+		host = node.Address
+	}
+
+	address := net.JoinHostPort(host, strconv.Itoa(listenPort))
+	u := &url.URL{
+		Scheme: scheme,
+		Host:   address,
+		Path:   path,
+	}
+	switch {
+	case password != "":
+		u.User = url.UserPassword(username, password)
+	case username != "":
+		u.User = url.User(username)
+	}
+	return u.String(), nil
 }
 
 // IsMySQLTablestatsGroupEnabled returns true if mysqld_exporter tablestats group collectors should be enabled.
@@ -418,6 +471,7 @@ func (s Agent) TemplateDelimiters(svc *Service) *DelimiterPair {
 		}
 	case PostgreSQLServiceType:
 	case ProxySQLServiceType:
+	case HAProxyServiceType:
 	case ExternalServiceType:
 	}
 

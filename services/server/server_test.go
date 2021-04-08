@@ -54,6 +54,10 @@ func TestServer(t *testing.T) {
 		mvmalert.Test(t)
 		mvmalert.On("RequestConfigurationUpdate").Return(nil)
 
+		malertmanager := new(mockAlertmanagerService)
+		malertmanager.Test(t)
+		malertmanager.On("RequestConfigurationUpdate").Return(nil)
+
 		par := new(mockVmAlertExternalRules)
 		par.Test(t)
 		par.On("ReadRules").Return("", nil)
@@ -68,6 +72,7 @@ func TestServer(t *testing.T) {
 			DB:                   reform.NewDB(sqlDB, postgresql.Dialect, reform.NewPrintfLogger(t.Logf)),
 			VMDB:                 mvmdb,
 			VMAlert:              mvmalert,
+			Alertmanager:         malertmanager,
 			AgentsRegistry:       mAgents,
 			Supervisord:          r,
 			VMAlertExternalRules: par,
@@ -208,6 +213,7 @@ func TestServer(t *testing.T) {
 		server.UpdateSettingsFromEnv([]string{
 			"PERCONA_TEST_DBAAS=1",
 			"ENABLE_ALERTING=1",
+			"ENABLE_AZUREDISCOVER=1",
 		})
 
 		ctx := context.TODO()
@@ -219,8 +225,40 @@ func TestServer(t *testing.T) {
 		require.NotNil(t, s)
 
 		settings, err := server.GetSettings(ctx, new(serverpb.GetSettingsRequest))
+
 		require.NoError(t, err)
 		assert.True(t, settings.Settings.DbaasEnabled)
 		assert.True(t, settings.Settings.AlertingEnabled)
+		assert.True(t, settings.Settings.AzurediscoverEnabled)
+	})
+
+	t.Run("ChangeSettings IA", func(t *testing.T) {
+		server := newServer(t)
+		rs := new(mockRulesService)
+		server.rulesService = rs
+		server.UpdateSettingsFromEnv([]string{})
+
+		ctx := context.TODO()
+		rs.On("RemoveVMAlertRulesFiles").Return(nil)
+		defer rs.AssertExpectations(t)
+		s, err := server.ChangeSettings(ctx, &serverpb.ChangeSettingsRequest{
+			DisableAlerting: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, s)
+
+		rs.On("WriteVMAlertRulesFiles")
+		s, err = server.ChangeSettings(ctx, &serverpb.ChangeSettingsRequest{
+			EnableAlerting: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, s)
+
+		rs.On("RemoveVMAlertRulesFiles").Return(nil)
+		s, err = server.ChangeSettings(ctx, &serverpb.ChangeSettingsRequest{
+			DisableAlerting: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, s)
 	})
 }

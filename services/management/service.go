@@ -29,15 +29,14 @@ import (
 	"github.com/percona/pmm-managed/models"
 )
 
-var (
-	serviceTypes = map[inventorypb.ServiceType]models.ServiceType{
-		inventorypb.ServiceType_MYSQL_SERVICE:      models.MySQLServiceType,
-		inventorypb.ServiceType_MONGODB_SERVICE:    models.MongoDBServiceType,
-		inventorypb.ServiceType_POSTGRESQL_SERVICE: models.PostgreSQLServiceType,
-		inventorypb.ServiceType_PROXYSQL_SERVICE:   models.ProxySQLServiceType,
-		inventorypb.ServiceType_EXTERNAL_SERVICE:   models.ExternalServiceType,
-	}
-)
+var serviceTypes = map[inventorypb.ServiceType]models.ServiceType{
+	inventorypb.ServiceType_MYSQL_SERVICE:      models.MySQLServiceType,
+	inventorypb.ServiceType_MONGODB_SERVICE:    models.MongoDBServiceType,
+	inventorypb.ServiceType_POSTGRESQL_SERVICE: models.PostgreSQLServiceType,
+	inventorypb.ServiceType_PROXYSQL_SERVICE:   models.ProxySQLServiceType,
+	inventorypb.ServiceType_HAPROXY_SERVICE:    models.HAProxyServiceType,
+	inventorypb.ServiceType_EXTERNAL_SERVICE:   models.ExternalServiceType,
+}
 
 // ServiceService represents service for working with services.
 type ServiceService struct {
@@ -107,7 +106,7 @@ func (s *ServiceService) RemoveService(ctx context.Context, req *managementpb.Re
 		return nil, e
 	}
 	for agentID := range pmmAgentIDs {
-		s.registry.SendSetStateRequest(ctx, agentID)
+		s.registry.RequestStateUpdate(ctx, agentID)
 	}
 	if reloadPrometheusConfig {
 		// It's required to regenerate victoriametrics config file for the agents which aren't run by pmm-agent.

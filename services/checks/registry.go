@@ -31,27 +31,67 @@ import (
 
 // registry stores alerts and delay information by IDs.
 type registry struct {
-	rw           sync.RWMutex
-	checkResults []sttCheckResult
-	alertTTL     time.Duration
-	nowF         func() time.Time // for tests
+	rw sync.RWMutex
+	// Results stored grouped by interval and by check name. It allows us to remove results for specific group.
+	checkResults map[check.Interval]map[string][]sttCheckResult
+
+	alertTTL time.Duration
+	nowF     func() time.Time // for tests
 }
 
 // newRegistry creates a new registry.
 func newRegistry(alertTTL time.Duration) *registry {
 	return &registry{
-		alertTTL: alertTTL,
-		nowF:     time.Now,
+		checkResults: make(map[check.Interval]map[string][]sttCheckResult),
+		alertTTL:     alertTTL,
+		nowF:         time.Now,
 	}
 }
 
-// set replaces stored checkResults with a copy of given ones.
+// set adds check results.
 func (r *registry) set(checkResults []sttCheckResult) {
 	r.rw.Lock()
 	defer r.rw.Unlock()
 
-	r.checkResults = make([]sttCheckResult, len(checkResults))
-	copy(r.checkResults, checkResults)
+	for _, result := range checkResults {
+		// Empty interval means standard.
+		if result.interval == "" {
+			result.interval = check.Standard
+		}
+
+		if _, ok := r.checkResults[result.interval]; !ok {
+			r.checkResults[result.interval] = make(map[string][]sttCheckResult)
+		}
+
+		r.checkResults[result.interval][result.checkName] = append(r.checkResults[result.interval][result.checkName], result)
+	}
+}
+
+// deleteByName removes results for specified checks.
+func (r *registry) deleteByName(checkNames []string) {
+	r.rw.Lock()
+	defer r.rw.Unlock()
+	for _, intervalGroup := range r.checkResults {
+		for _, name := range checkNames {
+			delete(intervalGroup, name)
+		}
+	}
+}
+
+// deleteByInterval removes results for specified interval.
+func (r *registry) deleteByInterval(interval check.Interval) {
+	r.rw.Lock()
+	defer r.rw.Unlock()
+
+	delete(r.checkResults, interval)
+}
+
+// cleanup removes all stt results form registry.
+func (r *registry) cleanup() {
+	r.rw.Lock()
+	defer r.rw.Unlock()
+
+	r.checkResults = make(map[check.Interval]map[string][]sttCheckResult)
 }
 
 // collect returns a slice of alerts created from the stored check results.
@@ -59,9 +99,13 @@ func (r *registry) collect() ammodels.PostableAlerts {
 	r.rw.RLock()
 	defer r.rw.RUnlock()
 
-	alerts := make(ammodels.PostableAlerts, len(r.checkResults))
-	for i, checkResult := range r.checkResults {
-		alerts[i] = r.createAlert(checkResult.checkName, &checkResult.target, &checkResult.result, r.alertTTL)
+	var alerts ammodels.PostableAlerts
+	for _, intervalGroup := range r.checkResults {
+		for _, checkNameGroup := range intervalGroup {
+			for _, checkResult := range checkNameGroup {
+				alerts = append(alerts, r.createAlert(checkResult.checkName, &checkResult.target, &checkResult.result, r.alertTTL))
+			}
+		}
 	}
 	return alerts
 }
@@ -70,10 +114,14 @@ func (r *registry) getCheckResults() []sttCheckResult {
 	r.rw.RLock()
 	defer r.rw.RUnlock()
 
-	checkResults := make([]sttCheckResult, 0, len(r.checkResults))
-	checkResults = append(checkResults, r.checkResults...)
+	var results []sttCheckResult
+	for _, intervalGroup := range r.checkResults {
+		for _, checkNameGroup := range intervalGroup {
+			results = append(results, checkNameGroup...)
+		}
+	}
 
-	return checkResults
+	return results
 }
 
 func (r *registry) createAlert(name string, target *target, result *check.Result, alertTTL time.Duration) *ammodels.PostableAlert {
@@ -93,6 +141,7 @@ func (r *registry) createAlert(name string, target *target, result *check.Result
 
 	annotations["summary"] = result.Summary
 	annotations["description"] = result.Description
+	annotations["read_more_url"] = result.ReadMoreURL
 
 	endsAt := r.nowF().Add(alertTTL).UTC().Round(0) // strip a monotonic clock reading
 	return &ammodels.PostableAlert{
@@ -112,6 +161,7 @@ func makeID(target *target, result *check.Result) string {
 	fmt.Fprintf(s, "%s\n", target.serviceID)
 	fmt.Fprintf(s, "%s\n", result.Summary)
 	fmt.Fprintf(s, "%s\n", result.Description)
+	fmt.Fprintf(s, "%s\n", result.ReadMoreURL)
 	fmt.Fprintf(s, "%v\n", result.Severity)
 	return alertsPrefix + hex.EncodeToString(s.Sum(nil))
 }

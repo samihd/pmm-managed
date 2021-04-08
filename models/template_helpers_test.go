@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AlekSi/pointer"
 	"github.com/brianvoe/gofakeit"
 	"github.com/percona-platform/saas/pkg/alert"
 	"github.com/percona-platform/saas/pkg/common"
@@ -63,12 +64,12 @@ func TestRuleTemplates(t *testing.T) {
 			models.TemplateParams{{
 				Name:    params.Template.Params[0].Name,
 				Summary: params.Template.Params[0].Summary,
-				Unit:    params.Template.Params[0].Unit,
+				Unit:    string(params.Template.Params[0].Unit),
 				Type:    models.Float,
 				FloatParam: &models.FloatParam{
-					Default: params.Template.Params[0].Value.(float64),
-					Min:     params.Template.Params[0].Range[0].(float64),
-					Max:     params.Template.Params[0].Range[1].(float64),
+					Default: pointer.ToFloat64(params.Template.Params[0].Value.(float64)),
+					Min:     pointer.ToFloat64(params.Template.Params[0].Range[0].(float64)),
+					Max:     pointer.ToFloat64(params.Template.Params[0].Range[1].(float64)),
 				},
 			}},
 			created.Params)
@@ -97,44 +98,65 @@ func TestRuleTemplates(t *testing.T) {
 
 		name := gofakeit.UUID()
 
-		cParams := createTemplateParams(name)
-		_, err = models.CreateTemplate(q, cParams)
+		createParams := createTemplateParams(name)
+		_, err = models.CreateTemplate(q, createParams)
 		require.NoError(t, err)
 
-		uParams := changeTemplateParams(name)
-		updated, err := models.ChangeTemplate(q, uParams)
+		updateParams := changeTemplateParams(name)
+		updated, err := models.ChangeTemplate(q, updateParams)
 		require.NoError(t, err)
 
-		assert.Equal(t, uParams.Template.Name, updated.Name)
-		assert.Equal(t, uParams.Template.Version, updated.Version)
-		assert.Equal(t, uParams.Template.Summary, updated.Summary)
-		assert.ElementsMatch(t, uParams.Template.Tiers, updated.Tiers)
-		assert.Equal(t, uParams.Template.Expr, updated.Expr)
+		assert.Equal(t, updateParams.Template.Name, updated.Name)
+		assert.Equal(t, updateParams.Template.Version, updated.Version)
+		assert.Equal(t, updateParams.Template.Summary, updated.Summary)
+		assert.ElementsMatch(t, updateParams.Template.Tiers, updated.Tiers)
+		assert.Equal(t, updateParams.Template.Expr, updated.Expr)
 		assert.Equal(t,
 			models.TemplateParams{{
-				Name:    uParams.Template.Params[0].Name,
-				Summary: uParams.Template.Params[0].Summary,
-				Unit:    uParams.Template.Params[0].Unit,
+				Name:    updateParams.Template.Params[0].Name,
+				Summary: updateParams.Template.Params[0].Summary,
+				Unit:    string(updateParams.Template.Params[0].Unit),
 				Type:    models.Float,
 				FloatParam: &models.FloatParam{
-					Default: uParams.Template.Params[0].Value.(float64),
-					Min:     uParams.Template.Params[0].Range[0].(float64),
-					Max:     uParams.Template.Params[0].Range[1].(float64),
+					Default: pointer.ToFloat64(updateParams.Template.Params[0].Value.(float64)),
+					Min:     pointer.ToFloat64(updateParams.Template.Params[0].Range[0].(float64)),
+					Max:     pointer.ToFloat64(updateParams.Template.Params[0].Range[1].(float64)),
 				},
 			}},
 			updated.Params)
-		assert.EqualValues(t, uParams.Template.For, updated.For)
+		assert.EqualValues(t, updateParams.Template.For, updated.For)
 		assert.Equal(t, models.Severity(common.Warning), updated.Severity)
 
 		labels, err := updated.GetLabels()
 		require.NoError(t, err)
-		assert.Equal(t, uParams.Template.Labels, labels)
+		assert.Equal(t, updateParams.Template.Labels, labels)
 
 		annotations, err := updated.GetAnnotations()
 		require.NoError(t, err)
-		assert.Equal(t, uParams.Template.Annotations, annotations)
+		assert.Equal(t, updateParams.Template.Annotations, annotations)
 
-		assert.Equal(t, cParams.Source, updated.Source)
+		assert.Equal(t, createParams.Source, updated.Source)
+	})
+
+	t.Run("change err - mismatch names", func(t *testing.T) {
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, tx.Rollback())
+		}()
+
+		q := tx.Querier
+
+		name := gofakeit.UUID()
+
+		createParams := createTemplateParams(name)
+		_, err = models.CreateTemplate(q, createParams)
+		require.NoError(t, err)
+
+		updateParams := changeTemplateParams(name)
+		updateParams.Name = gofakeit.UUID()
+		_, err = models.ChangeTemplate(q, updateParams)
+		require.NotNil(t, err)
 	})
 
 	t.Run("remove", func(t *testing.T) {
@@ -169,15 +191,17 @@ func TestRuleTemplates(t *testing.T) {
 
 		q := tx.Querier
 
-		name := gofakeit.UUID()
+		templateName := gofakeit.UUID()
 
-		_, err = models.CreateTemplate(q, createTemplateParams(name))
+		_, err = models.CreateTemplate(q, createTemplateParams(templateName))
 		require.NoError(t, err)
 
-		_ = createRule(t, q, name)
+		channelID := createChannel(t, q)
 
-		err = models.RemoveTemplate(q, name)
-		tests.AssertGRPCError(t, status.Newf(codes.FailedPrecondition, "Failed to delete rule template %s, as it is being used by some rule.", name), err)
+		_ = createRule(t, q, channelID, templateName)
+
+		err = models.RemoveTemplate(q, templateName)
+		tests.AssertGRPCError(t, status.Newf(codes.FailedPrecondition, "Failed to delete rule template %s, as it is being used by some rule.", templateName), err)
 
 		templates, err := models.FindTemplates(q)
 		require.NoError(t, err)
@@ -228,7 +252,7 @@ func createTemplateParams(name string) *models.CreateTemplateParams {
 			Params: []alert.Parameter{{
 				Name:    gofakeit.UUID(),
 				Summary: gofakeit.Quote(),
-				Unit:    gofakeit.Letter(),
+				Unit:    alert.Percentage,
 				Type:    alert.Float,
 				Range:   []interface{}{float64(10), float64(100)},
 				Value:   float64(50),
@@ -244,6 +268,7 @@ func createTemplateParams(name string) *models.CreateTemplateParams {
 
 func changeTemplateParams(name string) *models.ChangeTemplateParams {
 	return &models.ChangeTemplateParams{
+		Name: name,
 		Template: &alert.Template{
 			Name:    name,
 			Version: 1,
@@ -253,7 +278,7 @@ func changeTemplateParams(name string) *models.ChangeTemplateParams {
 			Params: []alert.Parameter{{
 				Name:    gofakeit.UUID(),
 				Summary: gofakeit.Quote(),
-				Unit:    gofakeit.Letter(),
+				Unit:    alert.Seconds,
 				Type:    alert.Float,
 				Range:   []interface{}{float64(10), float64(100)},
 				Value:   float64(50),
@@ -266,17 +291,9 @@ func changeTemplateParams(name string) *models.ChangeTemplateParams {
 	}
 }
 
-func createRule(t *testing.T, q *reform.Querier, name string) string {
-	ch, err := models.CreateChannel(q, &models.CreateChannelParams{
-		Summary: "some summary",
-		EmailConfig: &models.EmailConfig{
-			To: []string{"test@test.test"},
-		},
-		Disabled: false,
-	})
-	require.NoError(t, err)
+func createRule(t *testing.T, q *reform.Querier, channelID, templateName string) string {
 	rule, err := models.CreateRule(q, &models.CreateRuleParams{
-		TemplateName: name,
+		TemplateName: templateName,
 		Disabled:     true,
 		RuleParams: []models.RuleParam{
 			{
@@ -289,7 +306,7 @@ func createRule(t *testing.T, q *reform.Querier, name string) string {
 		Severity:     models.Severity(common.Warning),
 		CustomLabels: map[string]string{"foo": "bar"},
 		Filters:      []models.Filter{{Type: models.Equal, Key: "value", Val: "10"}},
-		ChannelIDs:   []string{ch.ID},
+		ChannelIDs:   []string{channelID},
 	})
 	require.NoError(t, err)
 	return rule.ID

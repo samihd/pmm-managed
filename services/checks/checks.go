@@ -24,6 +24,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,14 +46,13 @@ import (
 )
 
 const (
-	defaultRestartInterval = 24 * time.Hour
-	defaultStartDelay      = time.Minute
+	defaultStartDelay = time.Minute
 
 	// Environment variables that affect checks service; only for testing.
-	envPublicKey       = "PERCONA_TEST_CHECKS_PUBLIC_KEY"
-	envRestartInterval = "PERCONA_TEST_CHECKS_INTERVAL" // not "restart" in the value - name is fixed
-	envCheckFile       = "PERCONA_TEST_CHECKS_FILE"
-	envResendInterval  = "PERCONA_TEST_CHECKS_RESEND_INTERVAL"
+	envPublicKey         = "PERCONA_TEST_CHECKS_PUBLIC_KEY"
+	envCheckFile         = "PERCONA_TEST_CHECKS_FILE"
+	envResendInterval    = "PERCONA_TEST_CHECKS_RESEND_INTERVAL"
+	envDisableStartDelay = "PERCONA_TEST_CHECKS_DISABLE_START_DELAY"
 
 	checksTimeout       = 5 * time.Minute  // timeout for checks downloading/execution
 	resultTimeout       = 20 * time.Second // should greater than agents.defaultQueryActionTimeout
@@ -93,7 +93,6 @@ type Service struct {
 	l               *logrus.Entry
 	host            string
 	publicKeys      []string
-	restartInterval time.Duration
 	startDelay      time.Duration
 	resendInterval  time.Duration
 	localChecksFile string // For testing
@@ -103,6 +102,11 @@ type Service struct {
 	postgreSQLChecks []check.Check
 	mongoDBChecks    []check.Check
 
+	tm             sync.Mutex
+	rareTicker     *time.Ticker
+	standardTicker *time.Ticker
+	frequentTicker *time.Ticker
+
 	mScriptsExecuted *prom.CounterVec
 	mAlertsGenerated *prom.CounterVec
 }
@@ -111,12 +115,10 @@ type Service struct {
 func New(agentsRegistry agentsRegistry, alertmanagerService alertmanagerService, db *reform.DB) (*Service, error) {
 	l := logrus.WithField("component", "checks")
 
-	var resendInterval time.Duration
+	resendInterval := defaultResendInterval
 	if d, err := time.ParseDuration(os.Getenv(envResendInterval)); err == nil && d > 0 {
 		l.Warnf("Interval changed to %s.", d)
 		resendInterval = d
-	} else {
-		resendInterval = defaultResendInterval
 	}
 
 	host, err := envvars.GetSAASHost()
@@ -133,9 +135,8 @@ func New(agentsRegistry agentsRegistry, alertmanagerService alertmanagerService,
 		l:               l,
 		host:            host,
 		publicKeys:      defaultPublicKeys,
-		restartInterval: defaultRestartInterval,
 		startDelay:      defaultStartDelay,
-		resendInterval:  resendInterval,
+		resendInterval:  defaultResendInterval,
 		localChecksFile: os.Getenv(envCheckFile),
 
 		mScriptsExecuted: prom.NewCounterVec(prom.CounterOpts{
@@ -157,9 +158,8 @@ func New(agentsRegistry agentsRegistry, alertmanagerService alertmanagerService,
 		s.publicKeys = strings.Split(k, ",")
 		l.Warnf("Public keys changed to %q.", k)
 	}
-	if d, err := time.ParseDuration(os.Getenv(envRestartInterval)); err == nil && d > 0 {
-		l.Warnf("Interval changed to %s; start delay disabled.", d)
-		s.restartInterval = d
+	if d, _ := strconv.ParseBool(os.Getenv(envDisableStartDelay)); d {
+		l.Warn("Start delay disabled.")
 		s.startDelay = 0
 	}
 
@@ -183,6 +183,12 @@ func (s *Service) Run(ctx context.Context) {
 	s.l.Info("Starting...")
 	defer s.l.Info("Done.")
 
+	settings, err := models.GetSettings(s.db)
+	if err != nil {
+		s.l.Errorf("Failed to get settings: %+v.", err)
+		return
+	}
+
 	// delay for the first run to allow all agents to connect
 	startCtx, startCancel := context.WithTimeout(ctx, s.startDelay)
 	<-startCtx.Done()
@@ -198,6 +204,15 @@ func (s *Service) Run(ctx context.Context) {
 		defer wg.Done()
 		s.resendAlerts(ctx)
 	}()
+
+	s.rareTicker = time.NewTicker(settings.SaaS.STTCheckIntervals.RareInterval)
+	defer s.rareTicker.Stop()
+
+	s.standardTicker = time.NewTicker(settings.SaaS.STTCheckIntervals.StandardInterval)
+	defer s.standardTicker.Stop()
+
+	s.frequentTicker = time.NewTicker(settings.SaaS.STTCheckIntervals.FrequentInterval)
+	defer s.frequentTicker.Stop()
 
 	wg.Add(1)
 	go func() {
@@ -227,11 +242,10 @@ func (s *Service) resendAlerts(ctx context.Context) {
 
 // restartChecks restarts checks until ctx is canceled.
 func (s *Service) restartChecks(ctx context.Context) {
-	t := time.NewTicker(s.restartInterval)
-	defer t.Stop()
+	// First checks run, start all checks from all groups.
+	err := s.StartChecks(ctx, "", nil) // start all checks
 
 	for {
-		err := s.StartChecks(ctx)
 		switch err {
 		case nil:
 			// nothing, continue
@@ -244,8 +258,15 @@ func (s *Service) restartChecks(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			// nothing, continue for loop
+		case <-s.rareTicker.C:
+			// Start all checks from rare group.
+			err = s.StartChecks(ctx, check.Rare, nil)
+		case <-s.standardTicker.C:
+			// Start all checks from standard group.
+			err = s.StartChecks(ctx, check.Standard, nil)
+		case <-s.frequentTicker.C:
+			// Start all checks from frequent group.
+			err = s.StartChecks(ctx, check.Frequent, nil)
 		}
 	}
 }
@@ -270,15 +291,20 @@ func (s *Service) GetSecurityCheckResults() ([]check.Result, error) {
 	return checkResults, nil
 }
 
-// StartChecks triggers STT checks downloading and execution. It returns services.ErrSTTDisabled if STT is disabled.
-func (s *Service) StartChecks(ctx context.Context) error {
+// StartChecks triggers STT checks downloading and execution. If intervalGroup specified only checks from that group
+// will be executed. If checkNames specified then only matched checks will be executed.
+func (s *Service) StartChecks(ctx context.Context, intervalGroup check.Interval, checkNames []string) error {
 	settings, err := models.GetSettings(s.db)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	if !settings.SaaS.STTEnabled {
 		return services.ErrSTTDisabled
+	}
+
+	if err = intervalGroup.Validate(); err != nil {
+		return errors.WithStack(err)
 	}
 
 	nCtx, cancel := context.WithTimeout(ctx, checksTimeout)
@@ -286,13 +312,18 @@ func (s *Service) StartChecks(ctx context.Context) error {
 
 	s.collectChecks(nCtx)
 
-	if err = s.executeChecks(nCtx); err != nil {
-		return err
+	if err = s.executeChecks(nCtx, intervalGroup, checkNames); err != nil {
+		return errors.WithStack(err)
 	}
 
 	s.alertmanagerService.SendAlerts(ctx, s.alertsRegistry.collect())
 
 	return nil
+}
+
+// CleanupAlerts drops all alerts in registry.
+func (s *Service) CleanupAlerts() {
+	s.alertsRegistry.cleanup()
 }
 
 // getMySQLChecks returns available MySQL checks.
@@ -446,47 +477,86 @@ func (s *Service) minPMMAgentVersion(t check.Type) *version.Parsed {
 	}
 }
 
-// executeChecks runs all available checks for all reachable services.
-func (s *Service) executeChecks(ctx context.Context) error {
-	s.l.Info("Executing checks...")
+// filterChecks filters checks by several parameters. If group specified then only matched checks will be returned,
+// empty group means `any interval`. If enable slice is specified then only matched checks will be returned, empty
+// enable slice means `all enabled`. Checks specified in disabled slice are skipped, empty `disabled` slice means
+// `nothing disabled`.
+func (s *Service) filterChecks(checks []check.Check, group check.Interval, disable, enable []string) []check.Check {
+	var res []check.Check
+	disableMap := make(map[string]struct{}, len(disable))
+	for _, e := range disable {
+		disableMap[e] = struct{}{}
+	}
 
+	enableMap := make(map[string]struct{}, len(enable))
+	for _, e := range enable {
+		enableMap[e] = struct{}{}
+	}
+
+	for _, c := range checks {
+		// If empty group passed, which means `any group`
+		// or check has required interval
+		// or check has empty interval and required interval is `standard`.
+		if group == "" || c.Interval == group || (group == check.Standard && c.Interval == "") {
+			// If check enabled explicitly or all checks enabled by passing empty `enable` slice.
+			if _, ok := enableMap[c.Name]; ok || len(enableMap) == 0 {
+				// Filter disabled checks.
+				if _, ok := disableMap[c.Name]; ok {
+					s.l.Warnf("Check %s is disabled, skipping it.", c.Name)
+					continue
+				}
+
+				res = append(res, c)
+			}
+		}
+	}
+
+	return res
+}
+
+// executeChecks runs checks for all reachable services. If intervalGroup specified only checks from that group will be
+// executed. If checkNames specified then only matched checks will be executed.
+func (s *Service) executeChecks(ctx context.Context, intervalGroup check.Interval, checkNames []string) error {
 	disabledChecks, err := s.GetDisabledChecks()
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	var checkResults []sttCheckResult
 
-	mySQLCheckResults := s.executeMySQLChecks(ctx, disabledChecks)
+	mySQLChecks := s.filterChecks(s.getMySQLChecks(), intervalGroup, disabledChecks, checkNames)
+	mySQLCheckResults := s.executeMySQLChecks(ctx, mySQLChecks)
 	checkResults = append(checkResults, mySQLCheckResults...)
 
-	postgreSQLCheckResults := s.executePostgreSQLChecks(ctx, disabledChecks)
+	postgreSQLChecks := s.filterChecks(s.getPostgreSQLChecks(), intervalGroup, disabledChecks, checkNames)
+	postgreSQLCheckResults := s.executePostgreSQLChecks(ctx, postgreSQLChecks)
 	checkResults = append(checkResults, postgreSQLCheckResults...)
 
-	mongoDBCheckResults := s.executeMongoDBChecks(ctx, disabledChecks)
+	mongoDBChecks := s.filterChecks(s.getMongoDBChecks(), intervalGroup, disabledChecks, checkNames)
+	mongoDBCheckResults := s.executeMongoDBChecks(ctx, mongoDBChecks)
 	checkResults = append(checkResults, mongoDBCheckResults...)
+
+	switch {
+	case len(checkNames) != 0:
+		// If we run some specific checks, delete previous results for them.
+		s.alertsRegistry.deleteByName(checkNames)
+	case intervalGroup != "":
+		// If we run whole interval group, delete previous results for that group.
+		s.alertsRegistry.deleteByInterval(intervalGroup)
+	default:
+		// If we run all checks, delete all previous results.
+		s.alertsRegistry.cleanup()
+	}
 
 	s.alertsRegistry.set(checkResults)
 
 	return nil
 }
 
-// executeMySQLChecks runs MySQL checks for available MySQL services.
-func (s *Service) executeMySQLChecks(ctx context.Context, except []string) []sttCheckResult {
-	m := make(map[string]struct{}, len(except))
-	for _, e := range except {
-		m[e] = struct{}{}
-	}
-
-	checks := s.getMySQLChecks()
-
+// executeMySQLChecks runs specified checks for available MySQL service.
+func (s *Service) executeMySQLChecks(ctx context.Context, checks []check.Check) []sttCheckResult {
 	var res []sttCheckResult
 	for _, c := range checks {
-		if _, ok := m[c.Name]; ok {
-			s.l.Debugf("Skipping disabled mySQL check %s", c.Name)
-			continue
-		}
-
 		pmmAgentVersion := s.minPMMAgentVersion(c.Type)
 		targets, err := s.findTargets(models.MySQLServiceType, pmmAgentVersion)
 		if err != nil {
@@ -533,22 +603,10 @@ func (s *Service) executeMySQLChecks(ctx context.Context, except []string) []stt
 	return res
 }
 
-// executePostgreSQLChecks runs PostgreSQL checks for available PostgreSQL services.
-func (s *Service) executePostgreSQLChecks(ctx context.Context, except []string) []sttCheckResult {
-	m := make(map[string]struct{}, len(except))
-	for _, e := range except {
-		m[e] = struct{}{}
-	}
-
-	checks := s.getPostgreSQLChecks()
-
+// executePostgreSQLChecks runs specified PostgreSQL checks for available PostgreSQL services.
+func (s *Service) executePostgreSQLChecks(ctx context.Context, checks []check.Check) []sttCheckResult {
 	var res []sttCheckResult
 	for _, c := range checks {
-		if _, ok := m[c.Name]; ok {
-			s.l.Debugf("Skipping disabled postgreSQL check %s", c.Name)
-			continue
-		}
-
 		pmmAgentVersion := s.minPMMAgentVersion(c.Type)
 		targets, err := s.findTargets(models.PostgreSQLServiceType, pmmAgentVersion)
 		if err != nil {
@@ -595,22 +653,10 @@ func (s *Service) executePostgreSQLChecks(ctx context.Context, except []string) 
 	return res
 }
 
-// executeMongoDBChecks runs MongoDB checks for available MongoDB services.
-func (s *Service) executeMongoDBChecks(ctx context.Context, except []string) []sttCheckResult {
-	m := make(map[string]struct{}, len(except))
-	for _, e := range except {
-		m[e] = struct{}{}
-	}
-
-	checks := s.getMongoDBChecks()
-
+// executeMongoDBChecks runs specified MongoDB checks for available MongoDB services.
+func (s *Service) executeMongoDBChecks(ctx context.Context, checks []check.Check) []sttCheckResult {
 	var res []sttCheckResult
 	for _, c := range checks {
-		if _, ok := m[c.Name]; ok {
-			s.l.Debugf("Skipping disabled mongoDB check %s", c.Name)
-			continue
-		}
-
 		pmmAgentVersion := s.minPMMAgentVersion(c.Type)
 		targets, err := s.findTargets(models.MongoDBServiceType, pmmAgentVersion)
 		if err != nil {
@@ -665,6 +711,7 @@ func (s *Service) executeMongoDBChecks(ctx context.Context, except []string) []s
 
 type sttCheckResult struct {
 	checkName string
+	interval  check.Interval
 	target    target
 	result    check.Result
 }
@@ -733,6 +780,7 @@ func (s *Service) processResults(ctx context.Context, sttCheck check.Check, targ
 	for i, result := range results {
 		checkResults[i] = sttCheckResult{
 			checkName: sttCheck.Name,
+			interval:  sttCheck.Interval,
 			target:    target,
 			result:    result,
 		}
@@ -840,6 +888,23 @@ func (s *Service) groupChecksByDB(checks []check.Check) (mySQLChecks, postgreSQL
 	}
 
 	return
+}
+
+// filterChecksByInterval filters checks according to their interval buckets.
+func filterChecksByInterval(checks []check.Check, interval check.Interval) []check.Check {
+	if interval == "" { // all checks
+		return checks
+	}
+
+	var res []check.Check
+	for _, c := range checks {
+		// Empty check interval equals standard interval.
+		if c.Interval == interval || (interval == check.Standard && c.Interval == "") {
+			res = append(res, c)
+		}
+	}
+
+	return res
 }
 
 // collectChecks loads checks from file or SaaS, and stores versions this pmm-managed can handle.
@@ -960,6 +1025,17 @@ func (s *Service) updateChecks(mySQLChecks, postgreSQLChecks, mongoDBChecks []ch
 	s.mySQLChecks = mySQLChecks
 	s.postgreSQLChecks = postgreSQLChecks
 	s.mongoDBChecks = mongoDBChecks
+}
+
+// UpdateIntervals updates STT restart timers intervals.
+func (s *Service) UpdateIntervals(rare, standard, frequent time.Duration) {
+	s.tm.Lock()
+	s.rareTicker.Reset(rare)
+	s.standardTicker.Reset(standard)
+	s.frequentTicker.Reset(frequent)
+	s.tm.Unlock()
+
+	s.l.Infof("Intervals are changed: rare %s, standard %s, frequent %s", rare, standard, frequent)
 }
 
 // verifySignatures verifies checks signatures and returns error in case of verification problem.

@@ -46,6 +46,13 @@ func TestSettings(t *testing.T) {
 			},
 			DataRetention: 30 * 24 * time.Hour,
 			AWSPartitions: []string{"aws"},
+			SaaS: models.SaaS{
+				STTCheckIntervals: models.STTCheckIntervals{
+					StandardInterval: 24 * time.Hour,
+					RareInterval:     78 * time.Hour,
+					FrequentInterval: 4 * time.Hour,
+				},
+			},
 		}
 		assert.Equal(t, expected, actual)
 	})
@@ -62,6 +69,13 @@ func TestSettings(t *testing.T) {
 			},
 			DataRetention: 30 * 24 * time.Hour,
 			AWSPartitions: []string{"aws"},
+			SaaS: models.SaaS{
+				STTCheckIntervals: models.STTCheckIntervals{
+					StandardInterval: 24 * time.Hour,
+					RareInterval:     78 * time.Hour,
+					FrequentInterval: 4 * time.Hour,
+				},
+			},
 		}
 		assert.Equal(t, expected, s)
 	})
@@ -306,6 +320,15 @@ func TestSettings(t *testing.T) {
 			ns, err := models.UpdateSettings(sqlDB, &models.ChangeSettingsParams{EnableSTTChecks: []string{"two"}})
 			require.NoError(t, err)
 			assert.ElementsMatch(t, ns.SaaS.DisabledSTTChecks, []string{"one", "three"})
+		})
+
+		t.Run("enable azure discover", func(t *testing.T) {
+			_, err := models.UpdateSettings(sqlDB, &models.ChangeSettingsParams{DisableAzurediscover: true})
+			require.NoError(t, err)
+
+			ns, err := models.UpdateSettings(sqlDB, &models.ChangeSettingsParams{EnableAzurediscover: true})
+			assert.NoError(t, err)
+			assert.True(t, ns.Azurediscover.Enabled)
 		})
 
 		t.Run("Integrated Alerting settings validation", func(t *testing.T) {

@@ -74,11 +74,18 @@ type ChangeSettingsParams struct {
 	DisableSTTChecks []string
 	// List of STT checks to enable
 	EnableSTTChecks []string
+	// STT check intevals
+	STTCheckIntervals STTCheckIntervals
 
 	// Enable DBaaS features.
 	EnableDBaaS bool
 	// Disable DBaaS features.
 	DisableDBaaS bool
+
+	// Enable Azure Discover features.
+	EnableAzurediscover bool
+	// Disable Azure Discover features.
+	DisableAzurediscover bool
 
 	// Enable Integrated Alerting features.
 	EnableAlerting bool
@@ -110,6 +117,11 @@ type ChangeSettingsParams struct {
 	// PMM Server public address.
 	PMMPublicAddress       string
 	RemovePMMPublicAddress bool
+
+	// Enable Backup Management features.
+	EnableBackupManagement bool
+	// Disable Backup Management features.
+	DisableBackupManagement bool
 }
 
 // UpdateSettings updates only non-zero, non-empty values.
@@ -168,6 +180,16 @@ func UpdateSettings(q reform.DBTX, params *ChangeSettingsParams) (*Settings, err
 		settings.SaaS.STTEnabled = true
 	}
 
+	if params.STTCheckIntervals.RareInterval != 0 {
+		settings.SaaS.STTCheckIntervals.RareInterval = params.STTCheckIntervals.RareInterval
+	}
+	if params.STTCheckIntervals.StandardInterval != 0 {
+		settings.SaaS.STTCheckIntervals.StandardInterval = params.STTCheckIntervals.StandardInterval
+	}
+	if params.STTCheckIntervals.FrequentInterval != 0 {
+		settings.SaaS.STTCheckIntervals.FrequentInterval = params.STTCheckIntervals.FrequentInterval
+	}
+
 	if len(params.DisableSTTChecks) != 0 {
 		settings.SaaS.DisabledSTTChecks = deduplicateStrings(append(settings.SaaS.DisabledSTTChecks, params.DisableSTTChecks...))
 	}
@@ -190,6 +212,7 @@ func UpdateSettings(q reform.DBTX, params *ChangeSettingsParams) (*Settings, err
 	if params.EnableDBaaS {
 		settings.DBaaS.Enabled = true
 	}
+
 	if params.DisableDBaaS {
 		settings.DBaaS.Enabled = false
 	}
@@ -218,8 +241,16 @@ func UpdateSettings(q reform.DBTX, params *ChangeSettingsParams) (*Settings, err
 	if params.PMMPublicAddress != "" {
 		settings.PMMPublicAddress = params.PMMPublicAddress
 	}
+
 	if params.RemovePMMPublicAddress {
 		settings.PMMPublicAddress = ""
+	}
+
+	if params.DisableAzurediscover {
+		settings.Azurediscover.Enabled = false
+	}
+	if params.EnableAzurediscover {
+		settings.Azurediscover.Enabled = true
 	}
 
 	if params.DisableAlerting {
@@ -245,6 +276,14 @@ func UpdateSettings(q reform.DBTX, params *ChangeSettingsParams) (*Settings, err
 		settings.IntegratedAlerting.SlackAlertingSettings = params.SlackAlertingSettings
 	}
 
+	if params.DisableBackupManagement {
+		settings.BackupManagement.Enabled = false
+	}
+
+	if params.EnableBackupManagement {
+		settings.BackupManagement.Enabled = true
+	}
+
 	err = SaveSettings(q, settings)
 	if err != nil {
 		return nil, err
@@ -266,7 +305,10 @@ func ValidateSettings(params *ChangeSettingsParams) error {
 	if params.EnableAlerting && params.DisableAlerting {
 		return fmt.Errorf("Both enable_alerting and disable_alerting are present.") //nolint:golint,stylecheck
 	}
-
+	if params.EnableBackupManagement && params.DisableBackupManagement {
+		return fmt.Errorf("Both enable_backup_management and disable_backup_management are present.") //nolint:golint,stylecheck
+	}
+	// TODO: consider refactoring this and the validation for STT check intervals
 	checkCases := []struct {
 		dur       time.Duration
 		fieldName string
@@ -281,6 +323,31 @@ func ValidateSettings(params *ChangeSettingsParams) error {
 		}
 
 		if _, err := validators.ValidateMetricResolution(v.dur); err != nil {
+			switch err.(type) {
+			case validators.DurationNotAllowedError:
+				return fmt.Errorf("%s: should be a natural number of seconds", v.fieldName)
+			case validators.MinDurationError:
+				return fmt.Errorf("%s: minimal resolution is 1s", v.fieldName)
+			default:
+				return fmt.Errorf("%s: unknown error for", v.fieldName)
+			}
+		}
+	}
+
+	checkCases = []struct {
+		dur       time.Duration
+		fieldName string
+	}{
+		{params.STTCheckIntervals.RareInterval, "rare_interval"},
+		{params.STTCheckIntervals.StandardInterval, "standard_interval"},
+		{params.STTCheckIntervals.FrequentInterval, "frequent_interval"},
+	}
+	for _, v := range checkCases {
+		if v.dur == 0 {
+			continue
+		}
+
+		if _, err := validators.ValidateSTTCheckInterval(v.dur); err != nil {
 			switch err.(type) {
 			case validators.DurationNotAllowedError:
 				return fmt.Errorf("%s: should be a natural number of seconds", v.fieldName)

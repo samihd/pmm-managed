@@ -97,27 +97,27 @@ func (s PSMDBClusterService) ListPSMDBClusters(ctx context.Context, req *dbaasv1
 	return &dbaasv1beta1.ListPSMDBClustersResponse{Clusters: clusters}, nil
 }
 
-// GetPSMDBCluster returns a PSMDB cluster by name.
-func (s PSMDBClusterService) GetPSMDBCluster(ctx context.Context, req *dbaasv1beta1.GetPSMDBClusterRequest) (*dbaasv1beta1.GetPSMDBClusterResponse, error) {
+// GetPSMDBClusterCredentials returns a PSMDB cluster credentials by cluster name.
+func (s PSMDBClusterService) GetPSMDBClusterCredentials(ctx context.Context, req *dbaasv1beta1.GetPSMDBClusterCredentialsRequest) (*dbaasv1beta1.GetPSMDBClusterCredentialsResponse, error) {
 	kubernetesCluster, err := models.FindKubernetesClusterByName(s.db.Querier, req.KubernetesClusterName)
 	if err != nil {
 		return nil, err
 	}
 
-	in := &dbaascontrollerv1beta1.GetPSMDBClusterRequest{
+	in := &dbaascontrollerv1beta1.GetPSMDBClusterCredentialsRequest{
 		KubeAuth: &dbaascontrollerv1beta1.KubeAuth{
 			Kubeconfig: kubernetesCluster.KubeConfig,
 		},
 		Name: req.Name,
 	}
 
-	cluster, err := s.controllerClient.GetPSMDBCluster(ctx, in)
+	cluster, err := s.controllerClient.GetPSMDBClusterCredentials(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 
-	resp := dbaasv1beta1.GetPSMDBClusterResponse{
-		ConnectionCredentials: &dbaasv1beta1.GetPSMDBClusterResponse_PSMDBCredentials{
+	resp := dbaasv1beta1.GetPSMDBClusterCredentialsResponse{
+		ConnectionCredentials: &dbaasv1beta1.GetPSMDBClusterCredentialsResponse_PSMDBCredentials{
 			Username:   cluster.Credentials.Username,
 			Password:   cluster.Credentials.Password,
 			Host:       cluster.Credentials.Host,
@@ -148,6 +148,7 @@ func (s PSMDBClusterService) CreatePSMDBCluster(ctx context.Context, req *dbaasv
 		},
 		Name: req.Name,
 		Params: &dbaascontrollerv1beta1.PSMDBClusterParams{
+			Image:       req.Params.Image,
 			ClusterSize: req.Params.ClusterSize,
 			Replicaset: &dbaascontrollerv1beta1.PSMDBClusterParams_ReplicaSet{
 				ComputeResources: &dbaascontrollerv1beta1.ComputeResources{
@@ -253,6 +254,32 @@ func (s PSMDBClusterService) RestartPSMDBCluster(ctx context.Context, req *dbaas
 	}
 
 	return &dbaasv1beta1.RestartPSMDBClusterResponse{}, nil
+}
+
+// GetPSMDBClusterResources returns expected resources to be consumed by the cluster.
+func (s PSMDBClusterService) GetPSMDBClusterResources(ctx context.Context, req *dbaasv1beta1.GetPSMDBClusterResourcesRequest) (*dbaasv1beta1.GetPSMDBClusterResourcesResponse, error) {
+	settings, err := models.GetSettings(s.db.Querier)
+	if err != nil {
+		return nil, err
+	}
+
+	clusterSize := uint64(req.Params.ClusterSize)
+	memory := uint64(req.Params.Replicaset.ComputeResources.MemoryBytes) * 2 * clusterSize
+	cpu := uint64(req.Params.Replicaset.ComputeResources.CpuM) * 2 * clusterSize
+	disk := uint64(req.Params.Replicaset.DiskSize)*3 + uint64(req.Params.Replicaset.DiskSize)*clusterSize
+
+	if settings.PMMPublicAddress != "" {
+		memory += (3 + 2*clusterSize) * 500000000
+		cpu += (3 + 2*clusterSize) * 500
+	}
+
+	return &dbaasv1beta1.GetPSMDBClusterResourcesResponse{
+		Expected: &dbaasv1beta1.Resources{
+			CpuM:        cpu,
+			MemoryBytes: memory,
+			DiskSize:    disk,
+		},
+	}, nil
 }
 
 func psmdbStates() map[dbaascontrollerv1beta1.PSMDBClusterState]dbaasv1beta1.PSMDBClusterState {

@@ -60,11 +60,13 @@ type Server struct {
 	vmalert              vmAlertService
 	vmalertExternalRules vmAlertExternalRules
 	alertmanager         alertmanagerService
+	checksService        checksService
 	supervisord          supervisordService
 	telemetryService     telemetryService
 	platformService      platformService
 	awsInstanceChecker   *AWSInstanceChecker
 	grafanaClient        grafanaClient
+	rulesService         rulesService
 	l                    *logrus.Entry
 
 	pmmUpdateAuthFileM sync.Mutex
@@ -87,12 +89,14 @@ type Params struct {
 	VMDB                 prometheusService
 	VMAlert              prometheusService
 	Alertmanager         alertmanagerService
+	ChecksService        checksService
 	VMAlertExternalRules vmAlertExternalRules
 	Supervisord          supervisordService
 	TelemetryService     telemetryService
 	PlatformService      platformService
 	AwsInstanceChecker   *AWSInstanceChecker
 	GrafanaClient        grafanaClient
+	RulesService         rulesService
 }
 
 // NewServer returns new server for Server service.
@@ -109,12 +113,14 @@ func NewServer(params *Params) (*Server, error) {
 		r:                    params.AgentsRegistry,
 		vmalert:              params.VMAlert,
 		alertmanager:         params.Alertmanager,
+		checksService:        params.ChecksService,
 		vmalertExternalRules: params.VMAlertExternalRules,
 		supervisord:          params.Supervisord,
 		telemetryService:     params.TelemetryService,
 		platformService:      params.PlatformService,
 		awsInstanceChecker:   params.AwsInstanceChecker,
 		grafanaClient:        params.GrafanaClient,
+		rulesService:         params.RulesService,
 		l:                    logrus.WithField("component", "server"),
 		pmmUpdateAuthFile:    path,
 		envSettings:          new(models.ChangeSettingsParams),
@@ -397,16 +403,23 @@ func (s *Server) convertSettings(settings *models.Settings) *serverpb.Settings {
 			Mr: ptypes.DurationProto(settings.MetricsResolutions.MR),
 			Lr: ptypes.DurationProto(settings.MetricsResolutions.LR),
 		},
-		DataRetention:    ptypes.DurationProto(settings.DataRetention),
-		SshKey:           settings.SSHKey,
-		AwsPartitions:    settings.AWSPartitions,
-		AlertManagerUrl:  settings.AlertManagerURL,
-		SttEnabled:       settings.SaaS.STTEnabled,
-		PlatformEmail:    settings.SaaS.Email,
-		DbaasEnabled:     settings.DBaaS.Enabled,
-		PmmPublicAddress: settings.PMMPublicAddress,
+		SttCheckIntervals: &serverpb.STTCheckIntervals{
+			RareInterval:     ptypes.DurationProto(settings.SaaS.STTCheckIntervals.RareInterval),
+			StandardInterval: ptypes.DurationProto(settings.SaaS.STTCheckIntervals.StandardInterval),
+			FrequentInterval: ptypes.DurationProto(settings.SaaS.STTCheckIntervals.FrequentInterval),
+		},
+		DataRetention:        ptypes.DurationProto(settings.DataRetention),
+		SshKey:               settings.SSHKey,
+		AwsPartitions:        settings.AWSPartitions,
+		AlertManagerUrl:      settings.AlertManagerURL,
+		SttEnabled:           settings.SaaS.STTEnabled,
+		PlatformEmail:        settings.SaaS.Email,
+		DbaasEnabled:         settings.DBaaS.Enabled,
+		AzurediscoverEnabled: settings.Azurediscover.Enabled,
+		PmmPublicAddress:     settings.PMMPublicAddress,
 
-		AlertingEnabled: settings.IntegratedAlerting.Enabled,
+		AlertingEnabled:         settings.IntegratedAlerting.Enabled,
+		BackupManagementEnabled: settings.BackupManagement.Enabled,
 	}
 
 	if settings.IntegratedAlerting.EmailAlertingSettings != nil {
@@ -494,6 +507,11 @@ func (s *Server) validateChangeSettingsRequest(ctx context.Context, req *serverp
 		return status.Error(codes.FailedPrecondition, "Alerting is enabled via ENABLE_ALERTING environment variable.")
 	}
 
+	// ignore req.DisableAzurediscover even if they are present since that will not change anything
+	if req.DisableAzurediscover && s.envSettings.EnableAzurediscover {
+		return status.Error(codes.FailedPrecondition, "Azure Discover is enabled via ENABLE_AZUREDISCOVER environment variable.")
+	}
+
 	if getDuration(metricsRes.GetHr()) != 0 && s.envSettings.MetricsResolutions.HR != 0 {
 		return status.Error(codes.FailedPrecondition, "High resolution for metrics is set via METRICS_RESOLUTION_HR (or METRICS_RESOLUTION) environment variable.")
 	}
@@ -520,12 +538,24 @@ func (s *Server) ChangeSettings(ctx context.Context, req *serverpb.ChangeSetting
 		return nil, err
 	}
 
-	var settings *models.Settings
+	var newSettings, oldSettings *models.Settings
 	err := s.db.InTransaction(func(tx *reform.TX) error {
+		var e error
+
+		if oldSettings, e = models.GetSettings(tx); e != nil {
+			return errors.WithStack(e)
+		}
+
 		metricsRes := req.MetricsResolutions
+		sttCheckIntervals := req.SttCheckIntervals
 		settingsParams := &models.ChangeSettingsParams{
 			DisableTelemetry: req.DisableTelemetry,
 			EnableTelemetry:  req.EnableTelemetry,
+			STTCheckIntervals: models.STTCheckIntervals{
+				RareInterval:     getDuration(sttCheckIntervals.GetRareInterval()),
+				StandardInterval: getDuration(sttCheckIntervals.GetStandardInterval()),
+				FrequentInterval: getDuration(sttCheckIntervals.GetFrequentInterval()),
+			},
 			MetricsResolutions: models.MetricsResolutions{
 				HR: getDuration(metricsRes.GetHr()),
 				MR: getDuration(metricsRes.GetMr()),
@@ -538,6 +568,8 @@ func (s *Server) ChangeSettings(ctx context.Context, req *serverpb.ChangeSetting
 			SSHKey:                 req.SshKey,
 			EnableSTT:              req.EnableStt,
 			DisableSTT:             req.DisableStt,
+			EnableAzurediscover:    req.EnableAzurediscover,
+			DisableAzurediscover:   req.DisableAzurediscover,
 			PMMPublicAddress:       req.PmmPublicAddress,
 			RemovePMMPublicAddress: req.RemovePmmPublicAddress,
 
@@ -545,6 +577,8 @@ func (s *Server) ChangeSettings(ctx context.Context, req *serverpb.ChangeSetting
 			DisableAlerting:             req.DisableAlerting,
 			RemoveEmailAlertingSettings: req.RemoveEmailAlertingSettings,
 			RemoveSlackAlertingSettings: req.RemoveSlackAlertingSettings,
+			EnableBackupManagement:      req.EnableBackupManagement,
+			DisableBackupManagement:     req.DisableBackupManagement,
 		}
 
 		if req.EmailAlertingSettings != nil {
@@ -567,8 +601,7 @@ func (s *Server) ChangeSettings(ctx context.Context, req *serverpb.ChangeSetting
 			}
 		}
 
-		var e error
-		if settings, e = models.UpdateSettings(tx, settingsParams); e != nil {
+		if newSettings, e = models.UpdateSettings(tx, settingsParams); e != nil {
 			return status.Error(codes.InvalidArgument, e.Error())
 		}
 
@@ -600,6 +633,42 @@ func (s *Server) ChangeSettings(ctx context.Context, req *serverpb.ChangeSetting
 		return nil, err
 	}
 
+	// When IA moved from disabled state to enabled create rules files.
+	if !oldSettings.IntegratedAlerting.Enabled && req.EnableAlerting {
+		s.rulesService.WriteVMAlertRulesFiles()
+	}
+
+	// When IA moved from enabled state to disables cleanup rules files.
+	if oldSettings.IntegratedAlerting.Enabled && req.DisableAlerting {
+		if err := s.rulesService.RemoveVMAlertRulesFiles(); err != nil {
+			s.l.Errorf("Failed to clean old alert rule files: %+v", err)
+		}
+	}
+
+	// If STT intervals are changed reset timers.
+	if oldSettings.SaaS.STTCheckIntervals != newSettings.SaaS.STTCheckIntervals {
+		s.checksService.UpdateIntervals(
+			newSettings.SaaS.STTCheckIntervals.RareInterval,
+			newSettings.SaaS.STTCheckIntervals.StandardInterval,
+			newSettings.SaaS.STTCheckIntervals.FrequentInterval)
+	}
+
+	// When STT moved from disabled state to enabled force checks download and execution.
+	if !oldSettings.SaaS.STTEnabled && newSettings.SaaS.STTEnabled {
+		go func() {
+			// Start all checks from all groups.
+			err = s.checksService.StartChecks(context.Background(), "", nil)
+			if err != nil {
+				s.l.Error(err)
+			}
+		}()
+	}
+
+	// When STT moved from enabled state to disabled drop all existing STT alerts.
+	if oldSettings.SaaS.STTEnabled && !newSettings.SaaS.STTEnabled {
+		s.checksService.CleanupAlerts()
+	}
+
 	if isAgentsStateUpdateNeeded(req.MetricsResolutions) {
 		if err := s.r.UpdateAgentsState(ctx); err != nil {
 			return nil, err
@@ -607,7 +676,7 @@ func (s *Server) ChangeSettings(ctx context.Context, req *serverpb.ChangeSetting
 	}
 
 	return &serverpb.ChangeSettingsResponse{
-		Settings: s.convertSettings(settings),
+		Settings: s.convertSettings(newSettings),
 	}, nil
 }
 
@@ -622,6 +691,7 @@ func (s *Server) UpdateConfigurations() error {
 	}
 	s.vmdb.RequestConfigurationUpdate()
 	s.vmalert.RequestConfigurationUpdate()
+	s.alertmanager.RequestConfigurationUpdate()
 	return nil
 }
 
@@ -700,7 +770,7 @@ func (s *Server) AWSInstanceCheck(ctx context.Context, req *serverpb.AWSInstance
 func (s *Server) PlatformSignUp(ctx context.Context, req *serverpb.PlatformSignUpRequest) (*serverpb.PlatformSignUpResponse, error) {
 	nCtx, cancel := context.WithTimeout(ctx, platformAPITimeout)
 	defer cancel()
-	if err := s.platformService.SignUp(nCtx, req.Email, req.Password); err != nil {
+	if err := s.platformService.SignUp(nCtx, req.Email, req.FirstName, req.LastName); err != nil {
 		return nil, err
 	}
 

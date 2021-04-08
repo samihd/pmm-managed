@@ -104,27 +104,27 @@ func (s XtraDBClusterService) ListXtraDBClusters(ctx context.Context, req *dbaas
 	return &dbaasv1beta1.ListXtraDBClustersResponse{Clusters: clusters}, nil
 }
 
-// GetXtraDBCluster returns a XtraDB cluster.
-func (s XtraDBClusterService) GetXtraDBCluster(ctx context.Context, req *dbaasv1beta1.GetXtraDBClusterRequest) (*dbaasv1beta1.GetXtraDBClusterResponse, error) {
+// GetXtraDBClusterCredentials returns a XtraDB cluster credentials.
+func (s XtraDBClusterService) GetXtraDBClusterCredentials(ctx context.Context, req *dbaasv1beta1.GetXtraDBClusterCredentialsRequest) (*dbaasv1beta1.GetXtraDBClusterCredentialsResponse, error) {
 	kubernetesCluster, err := models.FindKubernetesClusterByName(s.db.Querier, req.KubernetesClusterName)
 	if err != nil {
 		return nil, err
 	}
 
-	in := &dbaascontrollerv1beta1.GetXtraDBClusterRequest{
+	in := &dbaascontrollerv1beta1.GetXtraDBClusterCredentialsRequest{
 		KubeAuth: &dbaascontrollerv1beta1.KubeAuth{
 			Kubeconfig: kubernetesCluster.KubeConfig,
 		},
 		Name: req.Name,
 	}
 
-	cluster, err := s.controllerClient.GetXtraDBCluster(ctx, in)
+	cluster, err := s.controllerClient.GetXtraDBClusterCredentials(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 
 	_ = kubernetesCluster
-	resp := dbaasv1beta1.GetXtraDBClusterResponse{
+	resp := dbaasv1beta1.GetXtraDBClusterCredentialsResponse{
 		ConnectionCredentials: &dbaasv1beta1.XtraDBClusterConnectionCredentials{
 			Username: cluster.Credentials.Username,
 			Password: cluster.Credentials.Password,
@@ -158,10 +158,12 @@ func (s XtraDBClusterService) CreateXtraDBCluster(ctx context.Context, req *dbaa
 		Params: &dbaascontrollerv1beta1.XtraDBClusterParams{
 			ClusterSize: req.Params.ClusterSize,
 			Pxc: &dbaascontrollerv1beta1.XtraDBClusterParams_PXC{
+				Image:            req.Params.Pxc.Image,
 				ComputeResources: new(dbaascontrollerv1beta1.ComputeResources),
 				DiskSize:         req.Params.Pxc.DiskSize,
 			},
 			Proxysql: &dbaascontrollerv1beta1.XtraDBClusterParams_ProxySQL{
+				Image:            req.Params.Proxysql.Image,
 				ComputeResources: new(dbaascontrollerv1beta1.ComputeResources),
 				DiskSize:         req.Params.Proxysql.DiskSize,
 			},
@@ -285,6 +287,32 @@ func (s XtraDBClusterService) RestartXtraDBCluster(ctx context.Context, req *dba
 	}
 
 	return &dbaasv1beta1.RestartXtraDBClusterResponse{}, nil
+}
+
+// GetXtraDBClusterResources returns expected resources to be consumed by the cluster.
+func (s XtraDBClusterService) GetXtraDBClusterResources(ctx context.Context, req *dbaasv1beta1.GetXtraDBClusterResourcesRequest) (*dbaasv1beta1.GetXtraDBClusterResourcesResponse, error) {
+	settings, err := models.GetSettings(s.db.Querier)
+	if err != nil {
+		return nil, err
+	}
+
+	clusterSize := uint64(req.Params.ClusterSize)
+	memory := uint64(req.Params.Pxc.ComputeResources.MemoryBytes+req.Params.Proxysql.ComputeResources.MemoryBytes) * clusterSize
+	cpu := uint64(req.Params.Pxc.ComputeResources.CpuM+req.Params.Proxysql.ComputeResources.CpuM) * clusterSize
+	disk := uint64(req.Params.Pxc.DiskSize+req.Params.Proxysql.DiskSize) * clusterSize
+
+	if settings.PMMPublicAddress != "" {
+		memory += 1000000000 * clusterSize
+		cpu += 1000 * clusterSize
+	}
+
+	return &dbaasv1beta1.GetXtraDBClusterResourcesResponse{
+		Expected: &dbaasv1beta1.Resources{
+			CpuM:        cpu,
+			MemoryBytes: memory,
+			DiskSize:    disk,
+		},
+	}, nil
 }
 
 func pxcStates() map[dbaascontrollerv1beta1.XtraDBClusterState]dbaasv1beta1.XtraDBClusterState {

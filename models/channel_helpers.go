@@ -27,9 +27,7 @@ import (
 	"gopkg.in/reform.v1"
 )
 
-var (
-	invalidConfigurationError = status.Error(codes.InvalidArgument, "Channel should contain only one type of channel configuration.")
-)
+var invalidConfigurationError = status.Error(codes.InvalidArgument, "Channel should contain only one type of channel configuration.")
 
 func checkUniqueChannelID(q *reform.Querier, id string) error {
 	if id == "" {
@@ -108,6 +106,31 @@ func FindChannels(q *reform.Querier) ([]*Channel, error) {
 	}
 
 	return channels, nil
+}
+
+// FindChannelsOnPage returns a page with saved notification channels.
+func FindChannelsOnPage(q *reform.Querier, pageIndex, pageSize int) ([]*Channel, error) {
+	rows, err := q.SelectAllFrom(ChannelTable, "ORDER BY id LIMIT $1 OFFSET $2", pageSize, pageIndex*pageSize)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to select notification channels")
+	}
+
+	channels := make([]*Channel, len(rows))
+	for i, s := range rows {
+		channels[i] = s.(*Channel)
+	}
+
+	return channels, nil
+}
+
+// CountChannels returns number of notification channels.
+func CountChannels(q *reform.Querier) (int, error) {
+	count, err := q.Count(ChannelTable, "")
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to count notification channels")
+	}
+
+	return count, nil
 }
 
 // FindChannelByID finds Channel by ID.
@@ -228,8 +251,7 @@ func CreateChannel(q *reform.Querier, params *CreateChannelParams) (*Channel, er
 		return nil, status.Error(codes.InvalidArgument, "Missing channel configuration.")
 	}
 
-	err := q.Insert(row)
-	if err != nil {
+	if err := q.Insert(row); err != nil {
 		return nil, errors.Wrap(err, "failed to create notifications channel")
 	}
 
@@ -310,8 +332,7 @@ func ChangeChannel(q *reform.Querier, channelID string, params *ChangeChannelPar
 
 	row.Disabled = params.Disabled
 
-	err = q.Update(row)
-	if err != nil {
+	if err = q.Update(row); err != nil {
 		return nil, errors.Wrap(err, "failed to update notifications channel")
 	}
 
@@ -324,9 +345,30 @@ func RemoveChannel(q *reform.Querier, id string) error {
 		return err
 	}
 
-	err := q.Delete(&Channel{ID: id})
+	inUse, err := channelInUse(q, id)
 	if err != nil {
+		return err
+	}
+
+	if inUse {
+		return status.Errorf(codes.FailedPrecondition, "Failed to delete notification channel %s, as it is being used by some rule.", id)
+	}
+
+	if err = q.Delete(&Channel{ID: id}); err != nil {
 		return errors.Wrap(err, "failed to delete notification channel")
 	}
+
 	return nil
+}
+
+func channelInUse(q *reform.Querier, id string) (bool, error) {
+	_, err := q.SelectOneFrom(RuleTable, "WHERE channel_ids ? $1", id)
+	switch err {
+	case nil:
+		return true, nil
+	case reform.ErrNoRows:
+		return false, nil
+	default:
+		return false, errors.WithStack(err)
+	}
 }

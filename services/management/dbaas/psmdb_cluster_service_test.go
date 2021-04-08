@@ -225,17 +225,17 @@ func TestPSMDBClusterService(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("BasicGetPSMDBCluster", func(t *testing.T) {
+	t.Run("BasicGetPSMDBClusterCredentials", func(t *testing.T) {
 		s := NewPSMDBClusterService(db, dbaasClient)
 
-		mockReq := controllerv1beta1.GetPSMDBClusterRequest{
+		mockReq := controllerv1beta1.GetPSMDBClusterCredentialsRequest{
 			KubeAuth: &controllerv1beta1.KubeAuth{
 				Kubeconfig: kubeconfTest,
 			},
 			Name: "third-psmdb-test",
 		}
 
-		dbaasClient.On("GetPSMDBCluster", ctx, &mockReq).Return(&controllerv1beta1.GetPSMDBClusterResponse{
+		dbaasClient.On("GetPSMDBClusterCredentials", ctx, &mockReq).Return(&controllerv1beta1.GetPSMDBClusterCredentialsResponse{
 			Credentials: &controllerv1beta1.PSMDBCredentials{
 				Username:   "userAdmin",
 				Password:   "userAdmin123",
@@ -245,41 +245,41 @@ func TestPSMDBClusterService(t *testing.T) {
 			},
 		}, nil)
 
-		in := dbaasv1beta1.GetPSMDBClusterRequest{
+		in := dbaasv1beta1.GetPSMDBClusterCredentialsRequest{
 			KubernetesClusterName: kubernetesClusterNameTest,
 			Name:                  "third-psmdb-test",
 		}
 
-		cluster, err := s.GetPSMDBCluster(ctx, &in)
+		cluster, err := s.GetPSMDBClusterCredentials(ctx, &in)
 
 		assert.NoError(t, err)
 		assert.Equal(t, "hostname", cluster.ConnectionCredentials.Host)
 	})
 
-	t.Run("BasicGetPSMDBClusterWithHost", func(t *testing.T) {
+	t.Run("BasicGetPSMDBClusterCredentialsWithHost", func(t *testing.T) {
 		s := NewPSMDBClusterService(db, dbaasClient)
 		name := "another-third-psmdb-test"
 
-		mockReq := controllerv1beta1.GetPSMDBClusterRequest{
+		mockReq := controllerv1beta1.GetPSMDBClusterCredentialsRequest{
 			KubeAuth: &controllerv1beta1.KubeAuth{
 				Kubeconfig: kubeconfTest,
 			},
 			Name: name,
 		}
 
-		resp := controllerv1beta1.GetPSMDBClusterResponse{
+		resp := controllerv1beta1.GetPSMDBClusterCredentialsResponse{
 			Credentials: &controllerv1beta1.PSMDBCredentials{
 				Host: "host",
 			},
 		}
-		dbaasClient.On("GetPSMDBCluster", ctx, &mockReq).Return(&resp, nil)
+		dbaasClient.On("GetPSMDBClusterCredentials", ctx, &mockReq).Return(&resp, nil)
 
-		in := dbaasv1beta1.GetPSMDBClusterRequest{
+		in := dbaasv1beta1.GetPSMDBClusterCredentialsRequest{
 			KubernetesClusterName: kubernetesClusterNameTest,
 			Name:                  name,
 		}
 
-		cluster, err := s.GetPSMDBCluster(ctx, &in)
+		cluster, err := s.GetPSMDBClusterCredentials(ctx, &in)
 
 		assert.NoError(t, err)
 		assert.Equal(t, resp.Credentials.Host, cluster.ConnectionCredentials.Host)
@@ -323,5 +323,28 @@ func TestPSMDBClusterService(t *testing.T) {
 
 		_, err := s.DeletePSMDBCluster(ctx, &in)
 		assert.NoError(t, err)
+	})
+
+	t.Run("BasicGetPSMDBClusterResources", func(t *testing.T) {
+		s := NewPSMDBClusterService(db, dbaasClient)
+
+		in := dbaasv1beta1.GetPSMDBClusterResourcesRequest{
+			Params: &dbaasv1beta1.PSMDBClusterParams{
+				ClusterSize: 4,
+				Replicaset: &dbaasv1beta1.PSMDBClusterParams_ReplicaSet{
+					ComputeResources: &dbaasv1beta1.ComputeResources{
+						CpuM:        2000,
+						MemoryBytes: 2000000000,
+					},
+					DiskSize: 2000000000,
+				},
+			},
+		}
+
+		actual, err := s.GetPSMDBClusterResources(ctx, &in)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(16000000000), actual.Expected.MemoryBytes)
+		assert.Equal(t, uint64(16000), actual.Expected.CpuM)
+		assert.Equal(t, uint64(14000000000), actual.Expected.DiskSize)
 	})
 }

@@ -210,17 +210,17 @@ func TestXtraDBClusterService(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("BasicGetXtraDBCluster", func(t *testing.T) {
+	t.Run("BasicGetXtraDBClusterCredentials", func(t *testing.T) {
 		name := "third-pxc-test"
 		s := NewXtraDBClusterService(db, dbaasClient)
-		mockReq := controllerv1beta1.GetXtraDBClusterRequest{
+		mockReq := controllerv1beta1.GetXtraDBClusterCredentialsRequest{
 			KubeAuth: &controllerv1beta1.KubeAuth{
 				Kubeconfig: pxcKubeconfigTest,
 			},
 			Name: name,
 		}
 
-		dbaasClient.On("GetXtraDBCluster", ctx, &mockReq).Return(&controllerv1beta1.GetXtraDBClusterResponse{
+		dbaasClient.On("GetXtraDBClusterCredentials", ctx, &mockReq).Return(&controllerv1beta1.GetXtraDBClusterCredentialsResponse{
 			Credentials: &controllerv1beta1.XtraDBCredentials{
 				Username: "root",
 				Password: "root_password",
@@ -229,12 +229,12 @@ func TestXtraDBClusterService(t *testing.T) {
 			},
 		}, nil)
 
-		in := dbaasv1beta1.GetXtraDBClusterRequest{
+		in := dbaasv1beta1.GetXtraDBClusterCredentialsRequest{
 			KubernetesClusterName: pxcKubernetesClusterNameTest,
 			Name:                  name,
 		}
 
-		actual, err := s.GetXtraDBCluster(ctx, &in)
+		actual, err := s.GetXtraDBClusterCredentials(ctx, &in)
 		assert.NoError(t, err)
 		assert.Equal(t, actual.ConnectionCredentials.Username, "root")
 		assert.Equal(t, actual.ConnectionCredentials.Password, "root_password")
@@ -242,17 +242,17 @@ func TestXtraDBClusterService(t *testing.T) {
 		assert.Equal(t, actual.ConnectionCredentials.Port, int32(3306))
 	})
 
-	t.Run("BasicGetXtraDBClusterWithHost", func(t *testing.T) { // Real kubernetes will have ingress
+	t.Run("BasicGetXtraDBClusterCredentialsWithHost", func(t *testing.T) { // Real kubernetes will have ingress
 		name := "another-third-pxc-test"
 		s := NewXtraDBClusterService(db, dbaasClient)
-		mockReq := controllerv1beta1.GetXtraDBClusterRequest{
+		mockReq := controllerv1beta1.GetXtraDBClusterCredentialsRequest{
 			KubeAuth: &controllerv1beta1.KubeAuth{
 				Kubeconfig: pxcKubeconfigTest,
 			},
 			Name: name,
 		}
 
-		mockCluster := &controllerv1beta1.GetXtraDBClusterResponse{
+		mockCluster := &controllerv1beta1.GetXtraDBClusterCredentialsResponse{
 			Credentials: &controllerv1beta1.XtraDBCredentials{
 				Username: "root",
 				Password: "root_password",
@@ -261,14 +261,14 @@ func TestXtraDBClusterService(t *testing.T) {
 			},
 		}
 
-		dbaasClient.On("GetXtraDBCluster", ctx, &mockReq).Return(mockCluster, nil)
+		dbaasClient.On("GetXtraDBClusterCredentials", ctx, &mockReq).Return(mockCluster, nil)
 
-		in := dbaasv1beta1.GetXtraDBClusterRequest{
+		in := dbaasv1beta1.GetXtraDBClusterCredentialsRequest{
 			KubernetesClusterName: pxcKubernetesClusterNameTest,
 			Name:                  name,
 		}
 
-		actual, err := s.GetXtraDBCluster(ctx, &in)
+		actual, err := s.GetXtraDBClusterCredentials(ctx, &in)
 		assert.NoError(t, err)
 		assert.Equal(t, "root", actual.ConnectionCredentials.Username)
 		assert.Equal(t, "root_password", actual.ConnectionCredentials.Password)
@@ -412,5 +412,37 @@ func TestXtraDBClusterService(t *testing.T) {
 
 		_, err := s.DeleteXtraDBCluster(ctx, &in)
 		assert.NoError(t, err)
+	})
+
+	t.Run("BasicGetXtraDBClusterResources", func(t *testing.T) {
+		s := NewXtraDBClusterService(db, dbaasClient)
+		v := int64(1000000000)
+		r := int64(2000000000)
+
+		in := dbaasv1beta1.GetXtraDBClusterResourcesRequest{
+			Params: &dbaasv1beta1.XtraDBClusterParams{
+				ClusterSize: 1,
+				Pxc: &dbaasv1beta1.XtraDBClusterParams_PXC{
+					ComputeResources: &dbaasv1beta1.ComputeResources{
+						CpuM:        1000,
+						MemoryBytes: v,
+					},
+					DiskSize: v,
+				},
+				Proxysql: &dbaasv1beta1.XtraDBClusterParams_ProxySQL{
+					ComputeResources: &dbaasv1beta1.ComputeResources{
+						CpuM:        1000,
+						MemoryBytes: v,
+					},
+					DiskSize: v,
+				},
+			},
+		}
+
+		actual, err := s.GetXtraDBClusterResources(ctx, &in)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(r), actual.Expected.MemoryBytes)
+		assert.Equal(t, uint64(2000), actual.Expected.CpuM)
+		assert.Equal(t, uint64(r), actual.Expected.DiskSize)
 	})
 }

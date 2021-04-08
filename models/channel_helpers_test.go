@@ -19,13 +19,17 @@ package models_test
 import (
 	"testing"
 
+	"github.com/brianvoe/gofakeit"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gopkg.in/reform.v1"
 	"gopkg.in/reform.v1/dialects/postgresql"
 
 	"github.com/percona/pmm-managed/models"
 	"github.com/percona/pmm-managed/utils/testdb"
+	"github.com/percona/pmm-managed/utils/tests"
 )
 
 func TestNotificationChannels(t *testing.T) {
@@ -74,7 +78,7 @@ func TestNotificationChannels(t *testing.T) {
 
 		q := tx.Querier
 
-		cParams := &models.CreateChannelParams{
+		createParams := &models.CreateChannelParams{
 			Summary: "some summary",
 			EmailConfig: &models.EmailConfig{
 				To:           []string{"test@test.test"},
@@ -83,10 +87,10 @@ func TestNotificationChannels(t *testing.T) {
 			Disabled: false,
 		}
 
-		created, err := models.CreateChannel(q, cParams)
+		created, err := models.CreateChannel(q, createParams)
 		require.NoError(t, err)
 
-		uParams := &models.ChangeChannelParams{
+		updateParams := &models.ChangeChannelParams{
 			Summary: "completely new summary",
 			SlackConfig: &models.SlackConfig{
 				SendResolved: true,
@@ -95,14 +99,14 @@ func TestNotificationChannels(t *testing.T) {
 			Disabled: true,
 		}
 
-		updated, err := models.ChangeChannel(q, created.ID, uParams)
+		updated, err := models.ChangeChannel(q, created.ID, updateParams)
 		require.NoError(t, err)
 		assert.Equal(t, models.Slack, updated.Type)
-		assert.Equal(t, uParams.Summary, updated.Summary)
-		assert.Equal(t, uParams.Disabled, updated.Disabled)
+		assert.Equal(t, updateParams.Summary, updated.Summary)
+		assert.Equal(t, updateParams.Disabled, updated.Disabled)
 		assert.Nil(t, updated.EmailConfig)
-		assert.Equal(t, uParams.SlackConfig.Channel, updated.SlackConfig.Channel)
-		assert.EqualValues(t, uParams.SlackConfig.SendResolved, updated.SlackConfig.SendResolved)
+		assert.Equal(t, updateParams.SlackConfig.Channel, updated.SlackConfig.Channel)
+		assert.EqualValues(t, updateParams.SlackConfig.SendResolved, updated.SlackConfig.SendResolved)
 
 		actual, err := models.FindChannelByID(q, created.ID)
 		require.NoError(t, err)
@@ -118,23 +122,40 @@ func TestNotificationChannels(t *testing.T) {
 
 		q := tx.Querier
 
-		params := &models.CreateChannelParams{
-			Summary: "some summary",
-			EmailConfig: &models.EmailConfig{
-				To: []string{"test@test.test"},
-			},
-			Disabled: false,
-		}
+		channelID := createChannel(t, q)
 
-		c, err := models.CreateChannel(q, params)
-		require.NoError(t, err)
-
-		err = models.RemoveChannel(q, c.ID)
+		err = models.RemoveChannel(q, channelID)
 		require.NoError(t, err)
 
 		cs, err := models.FindChannels(q)
 		require.NoError(t, err)
 		assert.Len(t, cs, 0)
+	})
+
+	t.Run("remove channel in use", func(t *testing.T) {
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, tx.Rollback())
+		}()
+
+		q := tx.Querier
+
+		templateName := gofakeit.UUID()
+
+		_, err = models.CreateTemplate(q, createTemplateParams(templateName))
+		require.NoError(t, err)
+
+		channelID := createChannel(t, q)
+
+		_ = createRule(t, q, channelID, templateName)
+
+		err = models.RemoveChannel(q, channelID)
+		tests.AssertGRPCError(t, status.Newf(codes.FailedPrecondition, "Failed to delete notification channel %s, as it is being used by some rule.", channelID), err)
+
+		cs, err := models.FindChannels(q)
+		require.NoError(t, err)
+		assert.NotEmpty(t, cs)
 	})
 
 	t.Run("find", func(t *testing.T) {

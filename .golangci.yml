@@ -6,8 +6,9 @@ linters-settings:
     packages:
       # use "github.com/pkg/errors" instead
       - errors
-      # use "github.com/golang/protobuf/proto" instead
+      # we use "github.com/golang/protobuf/proto" for now
       - github.com/gogo/protobuf/proto
+      - google.golang.org/protobuf/proto
       # use "github.com/percona-platform/saas" instead
       - github.com/percona-platform/platform
       # use "gopkg.in/yaml.v3" instead
@@ -38,6 +39,8 @@ linters:
     - gochecknoglobals  # mostly useless
     - gomnd             # we are using numbers in many cases
     - gomodguard        # we are not using modules
+    - interfacer        # deprecated
+    - maligned          # deprecated
     - nlreturn          # too annoying
     - scopelint         # too many false positives
     - wsl               # too annoying

@@ -42,8 +42,11 @@ import (
 	"github.com/percona/pmm/api/agentpb"
 	"github.com/percona/pmm/api/inventorypb"
 	"github.com/percona/pmm/api/managementpb"
+	azurev1beta1 "github.com/percona/pmm/api/managementpb/azure"
+	backupv1beta1 "github.com/percona/pmm/api/managementpb/backup"
 	dbaasv1beta1 "github.com/percona/pmm/api/managementpb/dbaas"
 	iav1beta1 "github.com/percona/pmm/api/managementpb/ia"
+	jobs1beta1 "github.com/percona/pmm/api/managementpb/jobs"
 	"github.com/percona/pmm/api/serverpb"
 	"github.com/percona/pmm/utils/sqlmetrics"
 	"github.com/percona/pmm/version"
@@ -70,6 +73,7 @@ import (
 	"github.com/percona/pmm-managed/services/inventory"
 	inventorygrpc "github.com/percona/pmm-managed/services/inventory/grpc"
 	"github.com/percona/pmm-managed/services/management"
+	"github.com/percona/pmm-managed/services/management/backup"
 	managementdbaas "github.com/percona/pmm-managed/services/management/dbaas"
 	managementgrpc "github.com/percona/pmm-managed/services/management/grpc"
 	"github.com/percona/pmm-managed/services/management/ia"
@@ -127,6 +131,11 @@ type gRPCServerDeps struct {
 	alertmanager          *alertmanager.Service
 	vmalert               *vmalert.Service
 	settings              *models.Settings
+	alertsService         *ia.AlertsService
+	templatesService      *ia.TemplatesService
+	rulesService          *ia.RulesService
+	jobsService           *agents.JobsService
+	versionServiceClient  *managementdbaas.VersionServiceClient
 }
 
 // runGRPCServer runs gRPC server until context is canceled, then gracefully stops it.
@@ -139,10 +148,12 @@ func runGRPCServer(ctx context.Context, deps *gRPCServerDeps) {
 
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
 			interceptors.Unary,
+			interceptors.UnaryServiceEnabledInterceptor(),
 			grpc_validator.UnaryServerInterceptor(),
 		)),
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
 			interceptors.Stream,
+			interceptors.StreamServiceEnabledInterceptor(),
 			grpc_validator.StreamServerInterceptor(),
 		)),
 	)
@@ -151,8 +162,8 @@ func runGRPCServer(ctx context.Context, deps *gRPCServerDeps) {
 
 	agentpb.RegisterAgentServer(gRPCServer, agentgrpc.NewAgentServer(deps.agentsRegistry))
 
-	nodesSvc := inventory.NewNodesService(deps.db)
-	servicesSvc := inventory.NewServicesService(deps.db, deps.agentsRegistry)
+	nodesSvc := inventory.NewNodesService(deps.db, deps.agentsRegistry, deps.vmdb)
+	servicesSvc := inventory.NewServicesService(deps.db, deps.agentsRegistry, deps.vmdb)
 	agentsSvc := inventory.NewAgentsService(deps.db, deps.agentsRegistry, deps.vmdb)
 
 	inventorypb.RegisterNodesServer(gRPCServer, inventorygrpc.NewNodesServer(nodesSvc))
@@ -165,7 +176,6 @@ func runGRPCServer(ctx context.Context, deps *gRPCServerDeps) {
 	mongodbSvc := management.NewMongoDBService(deps.db, deps.agentsRegistry)
 	postgresqlSvc := management.NewPostgreSQLService(deps.db, deps.agentsRegistry)
 	proxysqlSvc := management.NewProxySQLService(deps.db, deps.agentsRegistry)
-	checksSvc := management.NewChecksAPIService(deps.checksService)
 
 	managementpb.RegisterNodeServer(gRPCServer, managementgrpc.NewManagementNodeServer(nodeSvc))
 	managementpb.RegisterServiceServer(gRPCServer, managementgrpc.NewManagementServiceServer(serviceSvc))
@@ -175,22 +185,29 @@ func runGRPCServer(ctx context.Context, deps *gRPCServerDeps) {
 	managementpb.RegisterProxySQLServer(gRPCServer, managementgrpc.NewManagementProxySQLServer(proxysqlSvc))
 	managementpb.RegisterActionsServer(gRPCServer, managementgrpc.NewActionsServer(deps.agentsRegistry, deps.db))
 	managementpb.RegisterRDSServer(gRPCServer, management.NewRDSService(deps.db, deps.agentsRegistry))
+	azurev1beta1.RegisterAzureDatabaseServer(gRPCServer, management.NewAzureDatabaseService(deps.db, deps.agentsRegistry))
+	managementpb.RegisterHAProxyServer(gRPCServer, management.NewHAProxyService(deps.db, deps.agentsRegistry, deps.vmdb))
 	managementpb.RegisterExternalServer(gRPCServer, management.NewExternalService(deps.db, deps.agentsRegistry, deps.vmdb))
 	managementpb.RegisterAnnotationServer(gRPCServer, managementgrpc.NewAnnotationServer(deps.db, deps.grafanaClient))
-	managementpb.RegisterSecurityChecksServer(gRPCServer, managementgrpc.NewChecksServer(checksSvc))
+	managementpb.RegisterSecurityChecksServer(gRPCServer, management.NewChecksAPIService(deps.checksService))
+	jobs1beta1.RegisterJobsServer(gRPCServer, management.NewJobsAPIServer(deps.db, deps.jobsService))
 
 	iav1beta1.RegisterChannelsServer(gRPCServer, ia.NewChannelsService(deps.db, deps.alertmanager))
-	templatesSvc := ia.NewTemplatesService(deps.db)
-	templatesSvc.Collect(ctx)
-	iav1beta1.RegisterTemplatesServer(gRPCServer, templatesSvc)
-	iav1beta1.RegisterRulesServer(gRPCServer, ia.NewRulesService(deps.db, templatesSvc, deps.vmalert, deps.alertmanager))
-	iav1beta1.RegisterAlertsServer(gRPCServer, ia.NewAlertsService(deps.db, deps.alertmanager, templatesSvc))
+	deps.templatesService.Collect(ctx)
+	iav1beta1.RegisterTemplatesServer(gRPCServer, deps.templatesService)
+	iav1beta1.RegisterRulesServer(gRPCServer, deps.rulesService)
+	iav1beta1.RegisterAlertsServer(gRPCServer, deps.alertsService)
+
+	backupv1beta1.RegisterLocationsServer(gRPCServer, backup.NewLocationsService(deps.db))
+	backupv1beta1.RegisterArtifactsServer(gRPCServer, backup.NewArtifactsService(deps.db))
 
 	// TODO Remove once changing settings.DBaaS.Enabled is possible via API.
 	if deps.settings.DBaaS.Enabled {
 		dbaasv1beta1.RegisterKubernetesServer(gRPCServer, managementdbaas.NewKubernetesServer(deps.db, deps.dbaasControllerClient))
 		dbaasv1beta1.RegisterXtraDBClusterServer(gRPCServer, managementdbaas.NewXtraDBClusterService(deps.db, deps.dbaasControllerClient))
 		dbaasv1beta1.RegisterPSMDBClusterServer(gRPCServer, managementdbaas.NewPSMDBClusterService(deps.db, deps.dbaasControllerClient))
+		dbaasv1beta1.RegisterLogsAPIServer(gRPCServer, managementdbaas.NewLogsService(deps.db, deps.dbaasControllerClient))
+		dbaasv1beta1.RegisterComponentsServer(gRPCServer, managementdbaas.NewComponentsService(deps.db, deps.dbaasControllerClient, deps.versionServiceClient))
 	}
 
 	if l.Logger.GetLevel() >= logrus.DebugLevel {
@@ -259,7 +276,7 @@ func runHTTP1Server(ctx context.Context, deps *http1ServerDeps) {
 	proxyMux := grpc_gateway.NewServeMux(
 		grpc_gateway.WithMarshalerOption(grpc_gateway.MIMEWildcard, marshaller),
 	)
-	opts := []grpc.DialOption{grpc.WithInsecure()}
+	opts := []grpc.DialOption{grpc.WithInsecure(), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(5 * 1024 * 1024))}
 
 	// TODO switch from RegisterXXXHandlerFromEndpoint to RegisterXXXHandler to avoid extra dials
 	// (even if they dial to localhost)
@@ -280,6 +297,8 @@ func runHTTP1Server(ctx context.Context, deps *http1ServerDeps) {
 		managementpb.RegisterProxySQLHandlerFromEndpoint,
 		managementpb.RegisterActionsHandlerFromEndpoint,
 		managementpb.RegisterRDSHandlerFromEndpoint,
+		azurev1beta1.RegisterAzureDatabaseHandlerFromEndpoint,
+		managementpb.RegisterHAProxyHandlerFromEndpoint,
 		managementpb.RegisterExternalHandlerFromEndpoint,
 		managementpb.RegisterAnnotationHandlerFromEndpoint,
 		managementpb.RegisterSecurityChecksHandlerFromEndpoint,
@@ -289,9 +308,16 @@ func runHTTP1Server(ctx context.Context, deps *http1ServerDeps) {
 		iav1beta1.RegisterRulesHandlerFromEndpoint,
 		iav1beta1.RegisterTemplatesHandlerFromEndpoint,
 
+		backupv1beta1.RegisterLocationsHandlerFromEndpoint,
+		backupv1beta1.RegisterArtifactsHandlerFromEndpoint,
+
+		jobs1beta1.RegisterJobsHandlerFromEndpoint,
+
 		dbaasv1beta1.RegisterKubernetesHandlerFromEndpoint,
 		dbaasv1beta1.RegisterXtraDBClusterHandlerFromEndpoint,
 		dbaasv1beta1.RegisterPSMDBClusterHandlerFromEndpoint,
+		dbaasv1beta1.RegisterLogsAPIHandlerFromEndpoint,
+		dbaasv1beta1.RegisterComponentsHandlerFromEndpoint,
 	} {
 		if err := r(ctx, proxyMux, gRPCAddr, opts); err != nil {
 			l.Panic(err)
@@ -464,7 +490,7 @@ func setup(ctx context.Context, deps *setupDeps) bool {
 func getQANClient(ctx context.Context, sqlDB *sql.DB, dbName, qanAPIAddr string) *qan.Client {
 	opts := []grpc.DialOption{
 		grpc.WithInsecure(),
-		grpc.WithBackoffMaxDelay(time.Second),
+		grpc.WithBackoffMaxDelay(time.Second), //nolint:staticcheck
 		grpc.WithUserAgent("pmm-managed/" + version.Version),
 	}
 
@@ -526,6 +552,8 @@ func main() {
 	grafanaAddrF := kingpin.Flag("grafana-addr", "Grafana HTTP API address").Default("127.0.0.1:3000").String()
 	qanAPIAddrF := kingpin.Flag("qan-api-addr", "QAN API gRPC API address").Default("127.0.0.1:9911").String()
 	dbaasControllerAPIAddrF := kingpin.Flag("dbaas-controller-api-addr", "DBaaS Controller gRPC API address").Default("127.0.0.1:20201").String()
+
+	versionServiceAPIURLF := kingpin.Flag("version-service-api-url", "Version Service API URL").Default("https://check.percona.com/versions/v1").String()
 
 	postgresAddrF := kingpin.Flag("postgres-addr", "PostgreSQL address").Default("127.0.0.1:5432").String()
 	postgresDBNameF := kingpin.Flag("postgres-name", "PostgreSQL database name").Required().String()
@@ -618,18 +646,29 @@ func main() {
 		l.Fatalf("Could not create platform service: %s", err)
 	}
 
+	jobsService := agents.NewJobsService(db, agentsRegistry)
+
+	// Integrated alerts services
+	templatesService := ia.NewTemplatesService(db)
+	rulesService := ia.NewRulesService(db, templatesService, vmalert, alertmanager)
+	alertsService := ia.NewAlertsService(db, alertmanager, templatesService)
+
+	versionService := managementdbaas.NewVersionServiceClient(*versionServiceAPIURLF)
+
 	serverParams := &server.Params{
 		DB:                   db,
 		VMDB:                 vmdb,
 		VMAlert:              vmalert,
 		AgentsRegistry:       agentsRegistry,
 		Alertmanager:         alertmanager,
+		ChecksService:        checksService,
 		Supervisord:          supervisord,
 		TelemetryService:     telemetry,
 		PlatformService:      platformService,
 		AwsInstanceChecker:   awsInstanceChecker,
 		GrafanaClient:        grafanaClient,
 		VMAlertExternalRules: externalRules,
+		RulesService:         rulesService,
 	}
 
 	server, err := server.NewServer(serverParams)
@@ -708,6 +747,12 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		authServer.Run(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		vmalert.Run(ctx)
 	}()
 
@@ -760,6 +805,11 @@ func main() {
 			alertmanager:          alertmanager,
 			vmalert:               vmalert,
 			settings:              settings,
+			alertsService:         alertsService,
+			templatesService:      templatesService,
+			rulesService:          rulesService,
+			jobsService:           jobsService,
+			versionServiceClient:  versionService,
 		})
 	}()
 

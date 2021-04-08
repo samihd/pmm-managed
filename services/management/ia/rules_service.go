@@ -38,11 +38,13 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/percona/pmm-managed/models"
-	"github.com/percona/pmm-managed/services"
 	"github.com/percona/pmm-managed/utils/dir"
+	"github.com/percona/pmm-managed/utils/stringset"
 )
 
-const rulesDir = "/etc/ia/rules"
+const (
+	rulesDir = "/etc/ia/rules"
+)
 
 // RulesService represents API for Integrated Alerting Rules.
 type RulesService struct {
@@ -73,6 +75,16 @@ func NewRulesService(db *reform.DB, templates *TemplatesService, vmalert vmAlert
 	}
 }
 
+// Enabled returns if service is enabled and can be used.
+func (s *RulesService) Enabled() bool {
+	settings, err := models.GetSettings(s.db)
+	if err != nil {
+		s.l.WithError(err).Error("can't get settings")
+		return false
+	}
+	return settings.IntegratedAlerting.Enabled
+}
+
 // TODO Move this and related types to https://github.com/percona/promconfig
 // https://jira.percona.com/browse/PMM-7069
 type ruleFile struct {
@@ -92,8 +104,23 @@ type rule struct {
 	Annotations map[string]string   `yaml:"annotations,omitempty"`
 }
 
+// RemoveVMAlertRulesFiles removes all generated rules files (*.yml) on the ia path.
+func (s *RulesService) RemoveVMAlertRulesFiles() error {
+	matches, err := filepath.Glob(s.rulesPath + "/*.yml")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	for _, match := range matches {
+		if err = os.RemoveAll(match); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	return nil
+}
+
 // writeVMAlertRulesFiles converts all available rules to VMAlert rule files.
-func (s *RulesService) writeVMAlertRulesFiles() {
+func (s *RulesService) WriteVMAlertRulesFiles() {
 	rules, err := s.getAlertRules()
 	if err != nil {
 		s.l.Errorf("Failed to get available alert rules: %+v", err)
@@ -106,16 +133,9 @@ func (s *RulesService) writeVMAlertRulesFiles() {
 		return
 	}
 
-	matches, err := filepath.Glob(s.rulesPath + "/*.yml")
-	if err != nil {
+	if err = s.RemoveVMAlertRulesFiles(); err != nil {
 		s.l.Errorf("Failed to clean old alert rule files: %+v", err)
 		return
-	}
-
-	for _, match := range matches {
-		if err = os.RemoveAll(match); err != nil {
-			s.l.Errorf("Failed to remove old rule file: %+v", err)
-		}
 	}
 
 	for _, file := range ruleFiles {
@@ -159,32 +179,27 @@ func (s *RulesService) prepareRulesFiles(rules []*iav1beta1.Rule) ([]ruleFile, e
 
 			params[p.Name] = value
 		}
-
-		var buf bytes.Buffer
-		t, err := newParamTemplate().Parse(ruleM.Template.Expr)
+		var err error
+		r.Expr, err = templateRuleExpr(ruleM.Template.Expr, params)
 		if err != nil {
-			return nil, errors.Wrap(err, "Failed to parse rule expression")
+			return nil, errors.Wrap(err, "failed to template rule expression")
 		}
-		if err = t.Execute(&buf, params); err != nil {
-			return nil, errors.Wrap(err, "Failed to fill expression placeholders")
-		}
-		r.Expr = buf.String()
 
 		// Copy annotations form template
 		if err = transformMaps(ruleM.Template.Annotations, r.Annotations, params); err != nil {
-			return nil, errors.Wrap(err, "Failed to fill template annotations placeholders")
+			return nil, errors.Wrap(err, "failed to fill template annotations placeholders")
 		}
 
 		r.Annotations["rule"] = ruleM.Summary
 
 		// Copy labels form template
 		if err = transformMaps(ruleM.Template.Labels, r.Labels, params); err != nil {
-			return nil, errors.Wrap(err, "Failed to fill template labels placeholders")
+			return nil, errors.Wrap(err, "failed to fill template labels placeholders")
 		}
 
 		// Add rule labels
 		if err = transformMaps(ruleM.CustomLabels, r.Labels, params); err != nil {
-			return nil, errors.Wrap(err, "Failed to fill rule labels placeholders")
+			return nil, errors.Wrap(err, "failed to fill rule labels placeholders")
 		}
 
 		// Do not add volatile values like `{{ $value }}` to labels as it will break alerts identity.
@@ -246,20 +261,102 @@ func (s *RulesService) writeRuleFile(rule *ruleFile) error {
 
 // ListAlertRules returns a list of all Integrated Alerting rules.
 func (s *RulesService) ListAlertRules(ctx context.Context, req *iav1beta1.ListAlertRulesRequest) (*iav1beta1.ListAlertRulesResponse, error) {
-	settings, err := models.GetSettings(s.db)
+	var pageIndex int
+	var pageSize int
+	if req.PageParams != nil {
+		pageIndex = int(req.PageParams.Index)
+		pageSize = int(req.PageParams.PageSize)
+	}
+	var err error
+	var rules []*iav1beta1.Rule
+	pageTotals := &iav1beta1.PageTotals{
+		TotalPages: 1,
+	}
+	if pageSize == 0 {
+		rules, err = s.getAlertRules()
+		pageTotals.TotalItems = int32(len(rules))
+	} else {
+		rules, pageTotals, err = s.getAlertRulesPage(pageIndex, pageSize)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	if !settings.IntegratedAlerting.Enabled {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v.", services.ErrAlertingDisabled)
+	return &iav1beta1.ListAlertRulesResponse{Rules: rules, Totals: pageTotals}, nil
+}
+
+func (s *RulesService) convertAlertRules(rules []*models.Rule, channels []*models.Channel) ([]*iav1beta1.Rule, error) {
+	templates := s.templates.getTemplates()
+
+	res := make([]*iav1beta1.Rule, 0, len(rules))
+	for _, rule := range rules {
+		template, ok := templates[rule.TemplateName]
+		if !ok {
+			s.l.Warnf("template %s used by rule %s doesn't exist, skipping that rule", template.Name, rule.ID)
+			continue
+		}
+
+		r, err := convertRule(s.l, rule, template, channels)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		res = append(res, r)
 	}
 
-	res, err := s.getAlertRules()
-	if err != nil {
-		return nil, err
+	return res, nil
+}
+
+// getAlertRulesPage returns a page with list of available alert rules.
+func (s *RulesService) getAlertRulesPage(pageIndex, pageSize int) ([]*iav1beta1.Rule, *iav1beta1.PageTotals, error) {
+	var rules []*models.Rule
+	var channels []*models.Channel
+	var totalItems int
+	errTx := s.db.InTransaction(func(tx *reform.TX) error {
+		var err error
+		rules, err = models.FindRulesOnPage(tx.Querier, pageIndex, pageSize)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		totalItems, err = models.CountRules(tx.Querier)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		channelsIDs := make(map[string]struct{}, len(rules))
+		for _, rule := range rules {
+			for _, id := range rule.ChannelIDs {
+				channelsIDs[id] = struct{}{}
+			}
+		}
+
+		channels, err = models.FindChannelsByIDs(tx.Querier, stringset.ToSlice(channelsIDs))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		return nil
+	})
+	if errTx != nil {
+		return nil, nil, errors.WithStack(errTx)
 	}
-	return &iav1beta1.ListAlertRulesResponse{Rules: res}, nil
+
+	res, err := s.convertAlertRules(rules, channels)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	totalPages := totalItems / pageSize
+	if totalItems%pageSize > 0 {
+		totalPages++
+	}
+
+	totals := &iav1beta1.PageTotals{
+		TotalItems: int32(totalItems),
+		TotalPages: int32(totalPages),
+	}
+
+	return res, totals, nil
 }
 
 // getAlertRules returns list of available alert rules.
@@ -284,21 +381,9 @@ func (s *RulesService) getAlertRules() ([]*iav1beta1.Rule, error) {
 		return nil, e
 	}
 
-	templates := s.templates.getTemplates()
-
-	res := make([]*iav1beta1.Rule, 0, len(rules))
-	for _, rule := range rules {
-		template, ok := templates[rule.TemplateName]
-		if !ok {
-			s.l.Warnf("Template %s used by rule %s doesn't exist, skipping that rule", template.Name, rule.ID)
-			continue
-		}
-
-		r, err := convertRule(s.l, rule, template, channels)
-		if err != nil {
-			return nil, err
-		}
-		res = append(res, r)
+	res, err := s.convertAlertRules(rules, channels)
+	if err != nil {
+		return nil, errors.WithStack(err)
 	}
 
 	return res, nil
@@ -306,15 +391,6 @@ func (s *RulesService) getAlertRules() ([]*iav1beta1.Rule, error) {
 
 // CreateAlertRule creates Integrated Alerting rule.
 func (s *RulesService) CreateAlertRule(ctx context.Context, req *iav1beta1.CreateAlertRuleRequest) (*iav1beta1.CreateAlertRuleResponse, error) {
-	settings, err := models.GetSettings(s.db)
-	if err != nil {
-		return nil, err
-	}
-
-	if !settings.IntegratedAlerting.Enabled {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v.", services.ErrAlertingDisabled)
-	}
-
 	params := &models.CreateRuleParams{
 		TemplateName: req.TemplateName,
 		Summary:      req.Summary,
@@ -325,6 +401,7 @@ func (s *RulesService) CreateAlertRule(ctx context.Context, req *iav1beta1.Creat
 		ChannelIDs:   req.ChannelIds,
 	}
 
+	var err error
 	params.Filters, err = convertFiltersToModel(req.Filters)
 	if err != nil {
 		return nil, err
@@ -345,7 +422,7 @@ func (s *RulesService) CreateAlertRule(ctx context.Context, req *iav1beta1.Creat
 		return nil, e
 	}
 
-	s.writeVMAlertRulesFiles()
+	s.WriteVMAlertRulesFiles()
 	s.vmalert.RequestConfigurationUpdate()
 	s.alertManager.RequestConfigurationUpdate()
 
@@ -432,16 +509,8 @@ func (s *RulesService) processRuleParameters(param []*iav1beta1.RuleParam, templ
 
 // UpdateAlertRule updates Integrated Alerting rule.
 func (s *RulesService) UpdateAlertRule(ctx context.Context, req *iav1beta1.UpdateAlertRuleRequest) (*iav1beta1.UpdateAlertRuleResponse, error) {
-	settings, err := models.GetSettings(s.db)
-	if err != nil {
-		return nil, err
-	}
-
-	if !settings.IntegratedAlerting.Enabled {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v.", services.ErrAlertingDisabled)
-	}
-
 	params := &models.ChangeRuleParams{
+		Summary:      req.Summary,
 		Disabled:     req.Disabled,
 		For:          req.For.AsDuration(),
 		Severity:     models.Severity(req.Severity),
@@ -477,7 +546,7 @@ func (s *RulesService) UpdateAlertRule(ctx context.Context, req *iav1beta1.Updat
 		return nil, e
 	}
 
-	s.writeVMAlertRulesFiles()
+	s.WriteVMAlertRulesFiles()
 	s.vmalert.RequestConfigurationUpdate()
 	s.alertManager.RequestConfigurationUpdate()
 
@@ -486,15 +555,6 @@ func (s *RulesService) UpdateAlertRule(ctx context.Context, req *iav1beta1.Updat
 
 // ToggleAlertRule allows to switch between disabled and enabled states of an Alert Rule.
 func (s *RulesService) ToggleAlertRule(ctx context.Context, req *iav1beta1.ToggleAlertRuleRequest) (*iav1beta1.ToggleAlertRuleResponse, error) {
-	settings, err := models.GetSettings(s.db)
-	if err != nil {
-		return nil, err
-	}
-
-	if !settings.IntegratedAlerting.Enabled {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v.", services.ErrAlertingDisabled)
-	}
-
 	var params models.ToggleRuleParams
 	switch req.Disabled {
 	case iav1beta1.BooleanFlag_TRUE:
@@ -515,7 +575,7 @@ func (s *RulesService) ToggleAlertRule(ctx context.Context, req *iav1beta1.Toggl
 		return nil, e
 	}
 
-	s.writeVMAlertRulesFiles()
+	s.WriteVMAlertRulesFiles()
 	s.vmalert.RequestConfigurationUpdate()
 	s.alertManager.RequestConfigurationUpdate()
 
@@ -524,15 +584,6 @@ func (s *RulesService) ToggleAlertRule(ctx context.Context, req *iav1beta1.Toggl
 
 // DeleteAlertRule deletes Integrated Alerting rule.
 func (s *RulesService) DeleteAlertRule(ctx context.Context, req *iav1beta1.DeleteAlertRuleRequest) (*iav1beta1.DeleteAlertRuleResponse, error) {
-	settings, err := models.GetSettings(s.db)
-	if err != nil {
-		return nil, err
-	}
-
-	if !settings.IntegratedAlerting.Enabled {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v.", services.ErrAlertingDisabled)
-	}
-
 	e := s.db.InTransaction(func(tx *reform.TX) error {
 		return models.RemoveRule(tx.Querier, req.RuleId)
 	})
@@ -540,7 +591,7 @@ func (s *RulesService) DeleteAlertRule(ctx context.Context, req *iav1beta1.Delet
 		return nil, e
 	}
 
-	s.writeVMAlertRulesFiles()
+	s.WriteVMAlertRulesFiles()
 	s.vmalert.RequestConfigurationUpdate()
 	s.alertManager.RequestConfigurationUpdate()
 
@@ -639,6 +690,18 @@ func convertFiltersToModel(filters []*iav1beta1.Filter) (models.Filters, error) 
 	}
 
 	return res, nil
+}
+
+func templateRuleExpr(templateExpr string, params map[string]string) (string, error) {
+	var buf bytes.Buffer
+	t, err := newParamTemplate().Parse(templateExpr)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse rule expression")
+	}
+	if err = t.Execute(&buf, params); err != nil {
+		return "", errors.Wrap(err, "failed to fill expression placeholders")
+	}
+	return buf.String(), nil
 }
 
 // Check interfaces.
